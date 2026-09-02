@@ -36,6 +36,8 @@ type Task struct {
 	timer          *util.Timer
 	statusLock     *sync.Mutex
 	lock           *sync.Mutex
+	persistence    *taskPersistenceState
+	resumeOwner    *resumeStateOwner
 	blobRefLock    *sync.Mutex
 	blobURL        string
 	runGeneration  uint64
@@ -87,12 +89,16 @@ func (t *Task) Name() string {
 
 func (t *Task) MarshalJSON() ([]byte, error) {
 	type rawTaskType Task
+	snapshot := *t
+	if snapshotter, ok := t.fetcher.(fetcher.MetaSnapshotter); ok {
+		snapshot.Meta = snapshotter.MetaSnapshot()
+	}
 	jsonTask := struct {
 		rawTaskType
 		Name string `json:"name"`
 	}{
-		rawTaskType(*t),
-		t.Name(),
+		rawTaskType(snapshot),
+		snapshot.Name(),
 	}
 	return json.Marshal(jsonTask)
 }

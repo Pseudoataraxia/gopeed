@@ -14,15 +14,21 @@ import (
 // ============================================================================
 
 type fetcherData struct {
-	Connections           []*connection
-	RedirectURL           string // Saved redirect URL for resume
-	IfRange               string // Strong ETag or Last-Modified validator for safe resume
-	RangeReprobeEligible  bool   // Origin advertised Range before falling back to sequential mode
-	RangeValidatorPinned  bool   // Recovered Range mode must keep the same If-Range validator
-	SequentialSizeUnknown bool   // Interrupted chunked restart must retry from byte zero
-	Range                 *bool  // Authoritative Range mode; nil for records saved by older versions
-	ResourceSize          *int64 // Authoritative resource size from the same snapshot as Connections
-	FileSize              *int64 // Authoritative single-file size; nil for older records
+	Connections              []*connection
+	RedirectURL              string // Saved redirect URL for resume
+	IfRange                  string // Strong ETag or Last-Modified validator for safe resume
+	RangeReprobeEligible     bool   // Origin advertised Range before falling back to sequential mode
+	RangeValidatorPinned     bool   // Recovered Range mode must keep the same If-Range validator
+	SequentialSizeUnknown    bool   // Interrupted chunked restart must retry from byte zero
+	SequentialRestartPending bool   // Full response produced no bytes yet; retry must accept its current size
+	RecoveryGeneration       uint64 // Destructive file/recovery-state epoch
+	Range                    *bool  // Authoritative Range mode; nil for records saved by older versions
+	ResourceSize             *int64 // Authoritative resource size from the same snapshot as Connections
+	FileSize                 *int64 // Authoritative single-file size; nil for older records
+}
+
+func (fd *fetcherData) CheckpointGeneration() uint64 {
+	return fd.RecoveryGeneration
 }
 
 // ============================================================================
@@ -93,6 +99,8 @@ func (fm *FetcherManager) Store(f fetcher.Fetcher) (data any, err error) {
 	rangeReprobeEligible := _f.rangeReprobeEligible
 	rangeValidatorPinned := _f.rangeValidatorPinned
 	sequentialSizeUnknown := _f.sequentialSizeUnknown
+	sequentialRestartPending := _f.sequentialRestartPending
+	recoveryGeneration := _f.recoveryGeneration.Load()
 	var rangeMode *bool
 	var resourceSize *int64
 	var fileSize *int64
@@ -109,15 +117,17 @@ func (fm *FetcherManager) Store(f fetcher.Fetcher) (data any, err error) {
 	_f.connMu.Unlock()
 
 	return &fetcherData{
-		Connections:           connections,
-		RedirectURL:           redirectURL,
-		IfRange:               ifRange,
-		RangeReprobeEligible:  rangeReprobeEligible,
-		RangeValidatorPinned:  rangeValidatorPinned,
-		SequentialSizeUnknown: sequentialSizeUnknown,
-		Range:                 rangeMode,
-		ResourceSize:          resourceSize,
-		FileSize:              fileSize,
+		Connections:              connections,
+		RedirectURL:              redirectURL,
+		IfRange:                  ifRange,
+		RangeReprobeEligible:     rangeReprobeEligible,
+		RangeValidatorPinned:     rangeValidatorPinned,
+		SequentialSizeUnknown:    sequentialSizeUnknown,
+		SequentialRestartPending: sequentialRestartPending,
+		RecoveryGeneration:       recoveryGeneration,
+		Range:                    rangeMode,
+		ResourceSize:             resourceSize,
+		FileSize:                 fileSize,
 	}, nil
 }
 
@@ -164,6 +174,8 @@ func (fm *FetcherManager) Restore() (v any, f func(meta *fetcher.FetcherMeta, v 
 		fetcher.rangeReprobeEligible = fd.RangeReprobeEligible
 		fetcher.rangeValidatorPinned = fd.RangeValidatorPinned
 		fetcher.sequentialSizeUnknown = fd.SequentialSizeUnknown
+		fetcher.sequentialRestartPending = fd.SequentialRestartPending
+		fetcher.recoveryGeneration.Store(fd.RecoveryGeneration)
 		if fd.Range != nil && fetcher.meta.Res != nil {
 			// Recovery-critical resource fields live in the same persisted snapshot
 			// as Connections, making them authoritative over task metadata that may
@@ -175,6 +187,26 @@ func (fm *FetcherManager) Restore() (v any, f func(meta *fetcher.FetcherMeta, v 
 		}
 		if fd.FileSize != nil && fetcher.meta.Res != nil && len(fetcher.meta.Res.Files) > 0 && fetcher.meta.Res.Files[0] != nil {
 			fetcher.meta.Res.Files[0].Size = *fd.FileSize
+		}
+		if fetcher.meta.Res != nil && fetcher.meta.Res.Range && fetcher.ifRange == "" {
+			// Old or invalidated checkpoints may claim ranged progress without a
+			// representation validator. Discard every saved assignment and force an
+			// authoritative full response; no existing prefix is safe to reuse.
+			fetcher.meta.Res.Range = false
+			fetcher.connections = nil
+			fetcher.rangeReprobeEligible = false
+			fetcher.rangeValidatorPinned = false
+			fetcher.sequentialRestartPending = true
+		}
+		if fetcher.meta.Res != nil && !fetcher.meta.Res.Range && len(fd.Connections) == 0 {
+			// A task record without its sequential checkpoint cannot prove that the
+			// current target length belongs to the next full response. Force that
+			// response through beginSequentialResponse so stale tail bytes are
+			// truncated before any replacement is accepted.
+			fetcher.connections = nil
+			fetcher.rangeReprobeEligible = false
+			fetcher.rangeValidatorPinned = false
+			fetcher.sequentialRestartPending = true
 		}
 		return fetcher
 	}

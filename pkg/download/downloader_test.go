@@ -42,6 +42,12 @@ type generationTestManager struct {
 	pauseOnce      sync.Once
 }
 
+type generationCheckpoint struct {
+	Generation uint64
+}
+
+func (c *generationCheckpoint) CheckpointGeneration() uint64 { return c.Generation }
+
 func TestExtensionTaskMethodsMatchEventCapabilities(t *testing.T) {
 	taskType := reflect.TypeOf((*Task)(nil))
 	if _, ok := taskType.MethodByName("Continue"); ok {
@@ -88,21 +94,27 @@ func (m *generationTestManager) Filters() []*fetcher.SchemeFilter {
 func (m *generationTestManager) Build() fetcher.Fetcher {
 	return &generationTestFetcher{manager: m, meta: &fetcher.FetcherMeta{}}
 }
-func (m *generationTestManager) ParseName(string) string            { return "generation.bin" }
-func (m *generationTestManager) AutoRename() bool                   { return false }
-func (m *generationTestManager) DefaultConfig() any                 { return map[string]any{} }
-func (m *generationTestManager) Store(fetcher.Fetcher) (any, error) { return nil, nil }
+func (m *generationTestManager) ParseName(string) string { return "generation.bin" }
+func (m *generationTestManager) AutoRename() bool        { return false }
+func (m *generationTestManager) DefaultConfig() any      { return map[string]any{} }
+func (m *generationTestManager) Store(f fetcher.Fetcher) (any, error) {
+	return &generationCheckpoint{Generation: f.(fetcher.RecoveryGenerationProvider).RecoveryGeneration()}, nil
+}
 func (m *generationTestManager) Restore() (any, func(*fetcher.FetcherMeta, any) fetcher.Fetcher) {
-	return nil, func(meta *fetcher.FetcherMeta, _ any) fetcher.Fetcher {
-		return &generationTestFetcher{manager: m, meta: meta}
+	return &generationCheckpoint{}, func(meta *fetcher.FetcherMeta, v any) fetcher.Fetcher {
+		checkpoint := v.(*generationCheckpoint)
+		f := &generationTestFetcher{manager: m, meta: meta}
+		f.generation.Store(checkpoint.Generation)
+		return f
 	}
 }
 func (m *generationTestManager) Close() error { return nil }
 
 type generationTestFetcher struct {
-	manager *generationTestManager
-	meta    *fetcher.FetcherMeta
-	done    chan error
+	manager    *generationTestManager
+	meta       *fetcher.FetcherMeta
+	done       chan error
+	generation atomic.Uint64
 }
 
 func (f *generationTestFetcher) Setup(*controller.Controller) {
@@ -156,6 +168,290 @@ func (f *generationTestFetcher) Stats() any                 { return nil }
 func (f *generationTestFetcher) Meta() *fetcher.FetcherMeta { return f.meta }
 func (f *generationTestFetcher) Progress() fetcher.Progress { return fetcher.Progress{1} }
 func (f *generationTestFetcher) Wait() error                { return <-f.done }
+func (f *generationTestFetcher) RecoveryGeneration() uint64 { return f.generation.Load() }
+
+type blockingSaveStorage struct {
+	*MemStorage
+	putStarted chan struct{}
+	putRelease <-chan struct{}
+	putOnce    sync.Once
+}
+
+func (s *blockingSaveStorage) Put(bucket string, key string, v any) error {
+	blocked := false
+	if bucket == bucketSave {
+		s.putOnce.Do(func() {
+			blocked = true
+			close(s.putStarted)
+		})
+	}
+	if blocked {
+		<-s.putRelease
+	}
+	return s.MemStorage.Put(bucket, key, v)
+}
+
+func TestDownloader_SaveTaskRejectsCheckpointFromOlderRecoveryGeneration(t *testing.T) {
+	releasePut := make(chan struct{})
+	storage := &blockingSaveStorage{
+		MemStorage: NewMemStorage(),
+		putStarted: make(chan struct{}),
+		putRelease: releasePut,
+	}
+	manager := &generationTestManager{}
+	downloader := NewDownloader(&DownloaderConfig{
+		FetchManagers: []fetcher.FetcherManager{manager},
+		Storage:       storage,
+		StorageDir:    t.TempDir(),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	f := &generationTestFetcher{
+		manager: manager,
+		meta: &fetcher.FetcherMeta{
+			Req:  &base.Request{URL: "generation://checkpoint"},
+			Res:  &base.Resource{Size: 1, Files: []*base.FileInfo{{Name: "generation.bin", Size: 1}}},
+			Opts: &base.Options{Path: t.TempDir(), Name: "generation.bin"},
+		},
+	}
+	task := NewTask()
+	task.fetcherManager = manager
+	task.fetcher = f
+	task.Meta = f.meta
+	task.Progress = &Progress{}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- downloader.saveTask(task)
+	}()
+	select {
+	case <-storage.putStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("checkpoint write did not reach the interleaving point")
+	}
+
+	// Model the protocol's destructive transition. It advances the generation,
+	// then waits for the in-flight commit before durably raising the floor and
+	// deleting that now-stale checkpoint.
+	f.generation.Add(1)
+	invalidated := make(chan error, 1)
+	go func() { invalidated <- downloader.invalidateResumeState(task, f, nil) }()
+	close(releasePut)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("saveTask did not finish")
+	}
+	select {
+	case err := <-invalidated:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("checkpoint invalidation did not finish")
+	}
+
+	var saved generationCheckpoint
+	ok, err := storage.Get(bucketSave, task.ID, &saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatalf("stale checkpoint survived invalidation: %#v", saved)
+	}
+	var floor recoveryFloor
+	ok, err = storage.Get(bucketSaveFloor, task.ID, &floor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || floor.Generation != 1 {
+		t.Fatalf("recovery floor = %#v, found=%v; want generation 1", floor, ok)
+	}
+	if err := downloader.saveTask(task); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = storage.Get(bucketSave, task.ID, &saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || saved.Generation != 1 {
+		t.Fatalf("replacement checkpoint = %#v, found=%v; want generation 1", saved, ok)
+	}
+}
+
+func TestDownloader_RestoreRejectsCheckpointBelowRecoveryFloor(t *testing.T) {
+	storage := NewMemStorage()
+	manager := &generationTestManager{}
+	downloader := NewDownloader(&DownloaderConfig{
+		FetchManagers: []fetcher.FetcherManager{manager},
+		Storage:       storage,
+		StorageDir:    t.TempDir(),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	task := NewTask()
+	task.Protocol = manager.Name()
+	task.fetcherManager = manager
+	task.Meta = &fetcher.FetcherMeta{
+		Req:  &base.Request{URL: "generation://restore-floor"},
+		Res:  &base.Resource{Size: 1, Files: []*base.FileInfo{{Name: "generation.bin", Size: 1}}},
+		Opts: &base.Options{Path: t.TempDir(), Name: "generation.bin"},
+	}
+	task.Progress = &Progress{}
+	initTask(task)
+	if err := storage.Put(bucketSave, task.ID, &generationCheckpoint{Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Put(bucketSaveFloor, task.ID, &recoveryFloor{Generation: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := downloader.restoreFetcher(task); err != nil {
+		t.Fatal(err)
+	}
+	if got := task.fetcher.(fetcher.RecoveryGenerationProvider).RecoveryGeneration(); got != 0 {
+		t.Fatalf("restored stale generation = %d, want fresh generation 0", got)
+	}
+	var checkpoint generationCheckpoint
+	found, err := storage.Get(bucketSave, task.ID, &checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatalf("stale checkpoint remained after restore: %#v", checkpoint)
+	}
+}
+
+func TestDownloader_StaleFetcherCannotInvalidateReplacementCheckpoint(t *testing.T) {
+	storage := NewMemStorage()
+	downloader := NewDownloader(&DownloaderConfig{
+		Storage:    storage,
+		StorageDir: t.TempDir(),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	task := NewTask()
+	task.Progress = &Progress{}
+	initTask(task)
+	currentOwner := &resumeStateOwner{}
+	currentOwner.bind(task)
+	task.resumeOwner = currentOwner
+	staleOwner := &resumeStateOwner{}
+	staleOwner.bind(task)
+	if err := storage.Put(bucketSave, task.ID, &generationCheckpoint{Generation: 4}); err != nil {
+		t.Fatal(err)
+	}
+	staleFetcher := &generationTestFetcher{}
+	staleFetcher.generation.Store(5)
+	if err := downloader.invalidateResumeState(task, staleFetcher, staleOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	var checkpoint generationCheckpoint
+	found, err := storage.Get(bucketSave, task.ID, &checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || checkpoint.Generation != 4 {
+		t.Fatalf("stale fetcher changed replacement checkpoint: %#v, found=%v", checkpoint, found)
+	}
+	var floor recoveryFloor
+	found, err = storage.Get(bucketSaveFloor, task.ID, &floor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatalf("stale fetcher raised replacement recovery floor: %#v", floor)
+	}
+}
+
+func TestDownloader_DeleteCannotBeUndoneByInflightSave(t *testing.T) {
+	releasePut := make(chan struct{})
+	storage := &blockingSaveStorage{
+		MemStorage: NewMemStorage(),
+		putStarted: make(chan struct{}),
+		putRelease: releasePut,
+	}
+	manager := &generationTestManager{}
+	downloader := NewDownloader(&DownloaderConfig{
+		FetchManagers: []fetcher.FetcherManager{manager},
+		Storage:       storage,
+		StorageDir:    t.TempDir(),
+	})
+	if err := downloader.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer downloader.Clear()
+
+	f := &generationTestFetcher{
+		manager: manager,
+		meta: &fetcher.FetcherMeta{
+			Req:  &base.Request{URL: "generation://delete-save"},
+			Res:  &base.Resource{Size: 1, Files: []*base.FileInfo{{Name: "generation.bin", Size: 1}}},
+			Opts: &base.Options{Path: t.TempDir(), Name: "generation.bin"},
+		},
+	}
+	task := NewTask()
+	task.fetcherManager = manager
+	task.fetcher = f
+	task.Meta = f.meta
+	task.Progress = &Progress{}
+	initTask(task)
+	if err := storage.Put(bucketTask, task.ID, task.clone()); err != nil {
+		t.Fatal(err)
+	}
+
+	saved := make(chan error, 1)
+	go func() { saved <- downloader.saveTask(task) }()
+	select {
+	case <-storage.putStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("save did not reach the interleaving point")
+	}
+	deleted := make(chan error, 1)
+	go func() { deleted <- downloader.doDelete(task, false) }()
+	close(releasePut)
+	for _, result := range []<-chan error{saved, deleted} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("save/delete interleaving did not finish")
+		}
+	}
+	if err := downloader.saveTask(task); err != nil {
+		t.Fatal(err)
+	}
+	var persisted Task
+	found, err := storage.Get(bucketTask, task.ID, &persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("deleted task was resurrected by a late save")
+	}
+	var checkpoint generationCheckpoint
+	found, err = storage.Get(bucketSave, task.ID, &checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("deleted task checkpoint was resurrected by a late save")
+	}
+}
 
 func newTestDownloadOpt(t *testing.T) *base.Options {
 	t.Helper()

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -24,7 +25,8 @@ import (
 )
 
 type RequestError struct {
-	Code int
+	Code       int
+	RetryAfter time.Duration
 }
 
 // extractIfRangeValidator returns only validators that are strong enough for
@@ -46,7 +48,10 @@ func extractIfRangeValidator(header http.Header) string {
 	}
 	modifiedAt, modifiedErr := http.ParseTime(lastModified)
 	responseAt, responseErr := http.ParseTime(date)
-	if modifiedErr != nil || responseErr != nil || responseAt.Sub(modifiedAt) < time.Second {
+	// HTTP permits Last-Modified to act as a strong validator only when the
+	// origin's Date is at least 60 seconds later. Its one-second wire precision
+	// cannot otherwise distinguish two changes within the same minute.
+	if modifiedErr != nil || responseErr != nil || responseAt.Sub(modifiedAt) < 60*time.Second {
 		return ""
 	}
 	return lastModified
@@ -70,30 +75,28 @@ func NewRequestError(code int) *RequestError {
 	return &RequestError{Code: code}
 }
 
+func newResponseRequestError(resp *http.Response) *RequestError {
+	err := NewRequestError(resp.StatusCode)
+	err.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+	return err
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil && retryAt.After(now) {
+		return retryAt.Sub(now)
+	}
+	return 0
+}
+
 func (re *RequestError) Error() string {
 	return fmt.Sprintf("http request fail, code:%d", re.Code)
-}
-
-func isFailureExemptHTTPCode(code int) bool {
-	if code >= 500 && code <= 599 {
-		return true
-	}
-
-	switch code {
-	case 429, 408, 440, 499:
-		return true
-	default:
-		return false
-	}
-}
-
-func shouldCountHTTPFailure(err error) bool {
-	var re *RequestError
-	if !errors.As(err, &re) {
-		return false
-	}
-
-	return !isFailureExemptHTTPCode(re.Code)
 }
 
 func extractRequestError(err error) *RequestError {
@@ -185,8 +188,9 @@ func (f *Fetcher) hasRedirectURL() bool {
 	return f.redirectURL != "" && f.redirectURL != f.meta.Req.URL
 }
 
-// isRedirectExpiredError checks if the error indicates that the redirect URL may have expired.
-// This includes 403 (Forbidden), 401 (Unauthorized), 410 (Gone), and network errors.
+// isRedirectExpiredError checks statuses commonly returned by expired signed
+// redirects or their overloaded gateways. Transport errors are handled by the
+// connection retry loop because they do not carry an HTTP status.
 func isRedirectExpiredError(err error) bool {
 	if err == nil {
 		return false
@@ -195,9 +199,10 @@ func isRedirectExpiredError(err error) bool {
 	// Check for specific HTTP error codes that might indicate URL expiration
 	if re := extractRequestError(err); re != nil {
 		switch re.Code {
-		case 401, 403, 404, 410:
+		case 401, 403, 404, 408, 410, 429:
 			return true
 		}
+		return re.Code >= 500 && re.Code <= 599
 	}
 
 	return false
@@ -226,7 +231,7 @@ func (f *Fetcher) tryFallbackToOriginalURL(ctx context.Context, client *http.Cli
 
 	if resp.StatusCode != base.HttpCodeOK && resp.StatusCode != base.HttpCodePartialContent {
 		resp.Body.Close()
-		return nil, NewRequestError(resp.StatusCode)
+		return nil, newResponseRequestError(resp)
 	}
 
 	return resp, nil

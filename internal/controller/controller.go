@@ -11,6 +11,9 @@ import (
 type Controller struct {
 	GetConfig func(v any)
 	GetProxy  func(requestProxy *base.RequestProxy) func(*http.Request) (*url.URL, error)
+	// InvalidateResumeState removes a previously persisted recovery checkpoint
+	// before a protocol performs an in-place destructive file transition.
+	InvalidateResumeState func() error
 	FileController
 	//ContextDialer() (proxy.Dialer, error)
 }

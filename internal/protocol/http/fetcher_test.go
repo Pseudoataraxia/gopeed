@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -386,6 +387,7 @@ func TestFetcher_PauseBeforeStartDiscardsPrefetchProgress(t *testing.T) {
 	}
 	prefetchServed := make(chan struct{}, 1)
 	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		w.Header().Set(base.HttpHeaderETag, `"prefetch-v1"`)
 		if r.Header.Get(base.HttpHeaderRange) == "" {
 			w.Header().Set(base.HttpHeaderAcceptRanges, base.HttpHeaderBytes)
 			w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(payload)))
@@ -548,7 +550,7 @@ func TestFetcher_SequentialRetryReprobesRange(t *testing.T) {
 		etagB        = `"range-reprobe-b"`
 		weakETag     = `W/"range-reprobe-b"`
 		lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
-		laterDate    = "Wed, 21 Oct 2015 07:28:02 GMT"
+		laterDate    = "Wed, 21 Oct 2015 07:30:00 GMT"
 		failedSize   = 128 * 1024
 	)
 
@@ -649,8 +651,12 @@ func TestFetcher_SequentialRetryReprobesRange(t *testing.T) {
 					if requestNumber > 1 && tt.fullRestartReplacement != nil {
 						responsePayload = tt.fullRestartReplacement
 					}
-					if requestNumber == 1 && tt.resolveETag != "" {
-						w.Header().Set(base.HttpHeaderETag, tt.resolveETag)
+					if requestNumber == 1 {
+						resolveETag := tt.resolveETag
+						if resolveETag == "" {
+							resolveETag = etagA
+						}
+						w.Header().Set(base.HttpHeaderETag, resolveETag)
 					}
 					w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(responsePayload)))
 					w.WriteHeader(gohttp.StatusOK)
@@ -833,6 +839,7 @@ func TestFetcher_InitialIgnoredRangeUsesResponseSize(t *testing.T) {
 	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
 		w.Header().Set(base.HttpHeaderAcceptRanges, base.HttpHeaderBytes)
 		if r.Header.Get(base.HttpHeaderRange) == "" {
+			w.Header().Set(base.HttpHeaderETag, `"resolve-v1"`)
 			w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(resolvePayload)))
 			w.WriteHeader(gohttp.StatusOK)
 			_, _ = w.Write(resolvePayload)
@@ -889,6 +896,566 @@ func TestFetcher_InitialIgnoredRangeUsesResponseSize(t *testing.T) {
 	}
 }
 
+func TestFetcher_InitialRangePinsResolveValidator(t *testing.T) {
+	const (
+		validator = `"resolve-v1"`
+		prefixLen = 128 * 1024
+	)
+	oldPayload := bytes.Repeat([]byte("old-representation"), 256*1024)
+	newPayload := bytes.Repeat([]byte("new-representation"), 256*1024)
+	if len(oldPayload) != len(newPayload) {
+		t.Fatal("test representations must have the same size")
+	}
+	var sawIfRange atomic.Bool
+
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		w.Header().Set(base.HttpHeaderAcceptRanges, base.HttpHeaderBytes)
+		rangeHeader := r.Header.Get(base.HttpHeaderRange)
+		if rangeHeader == "" {
+			w.Header().Set(base.HttpHeaderETag, validator)
+			w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(oldPayload)))
+			w.WriteHeader(gohttp.StatusOK)
+			w.(gohttp.Flusher).Flush()
+			_, _ = w.Write(oldPayload[:prefixLen])
+			w.(gohttp.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+
+		var start, end int64
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+			w.WriteHeader(gohttp.StatusBadRequest)
+			return
+		}
+		if r.Header.Get(base.HttpHeaderIfRange) == validator {
+			sawIfRange.Store(true)
+			w.Header().Set(base.HttpHeaderETag, `"replacement-v2"`)
+			w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(newPayload)))
+			w.WriteHeader(gohttp.StatusOK)
+			_, _ = w.Write(newPayload)
+			return
+		}
+
+		w.Header().Set(base.HttpHeaderETag, `"replacement-v2"`)
+		w.Header().Set(base.HttpHeaderContentRange,
+			fmt.Sprintf("bytes %d-%d/%d", start, end, len(newPayload)))
+		w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", end-start+1))
+		w.WriteHeader(gohttp.StatusPartialContent)
+		_, _ = w.Write(newPayload[start : end+1])
+	}))
+	defer server.Close()
+
+	f := buildFetcher()
+	if err := f.Resolve(&base.Request{URL: server.URL + "/representation.data"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "representation.data",
+		Extra: &http.OptsExtra{
+			Connections: 1,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for f.prefetchSize.Load() < prefixLen && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := f.prefetchSize.Load(); got != prefixLen {
+		t.Fatalf("prefetched bytes = %d, want %d", got, prefixLen)
+	}
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	if !sawIfRange.Load() {
+		t.Fatalf("initial Range request omitted Resolve validator %s", validator)
+	}
+	got, err := os.ReadFile(f.meta.SingleFilepath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newPayload) {
+		t.Fatal("download combined bytes from two representations")
+	}
+}
+
+func TestFetcher_NoValidatorConsumesOneFullResponse(t *testing.T) {
+	payload := bytes.Repeat([]byte("single-representation"), 64*1024)
+	var requests atomic.Int32
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		requests.Add(1)
+		if got := r.Header.Get(base.HttpHeaderRange); got != "" {
+			t.Errorf("unguarded Range request = %q, want none", got)
+		}
+		w.Header().Set(base.HttpHeaderAcceptRanges, base.HttpHeaderBytes)
+		w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(payload)))
+		w.WriteHeader(gohttp.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+
+	f := buildFetcher()
+	if err := f.Resolve(&base.Request{URL: server.URL + "/no-validator.data"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "no-validator.data",
+		Extra: &http.OptsExtra{
+			Connections: 8,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if f.meta.Res.Range {
+		t.Fatal("resource without a strong validator kept parallel Range mode")
+	}
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want exactly one full response", got)
+	}
+	got, err := os.ReadFile(f.meta.SingleFilepath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("single-response download differs from source")
+	}
+}
+
+func TestFetcher_ResolveRejectsUnsolicitedPartialContent(t *testing.T) {
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if got := r.Header.Get(base.HttpHeaderRange); got != "" {
+			t.Errorf("Resolve unexpectedly sent Range %q", got)
+		}
+		w.Header().Set(base.HttpHeaderContentRange, "bytes 0-99/1000")
+		w.Header().Set(base.HttpHeaderContentLength, "100")
+		w.WriteHeader(gohttp.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 100))
+	}))
+	defer server.Close()
+
+	f := buildFetcher()
+	err := f.Resolve(&base.Request{
+		URL: server.URL + "/partial.data",
+		Extra: &http.ReqExtra{Header: map[string]string{
+			base.HttpHeaderRange:   "bytes=0-99",
+			base.HttpHeaderIfRange: `"caller-v1"`,
+		}},
+	}, &base.Options{
+		Path: t.TempDir(),
+		Name: "partial.data",
+	})
+	if !errors.Is(err, errInvalidRangeResponse) {
+		t.Fatalf("Resolve error = %v, want invalid range response", err)
+	}
+}
+
+func TestConnectionRetryDelayHonorsRetryAfter(t *testing.T) {
+	err := &RequestError{Code: gohttp.StatusTooManyRequests, RetryAfter: 5 * time.Second}
+	if got := connectionRetryDelay(err, 0); got != 5*time.Second {
+		t.Fatalf("retry delay = %s, want 5s", got)
+	}
+	if got := connectionRetryDelay(&RequestError{Code: gohttp.StatusTooManyRequests, RetryAfter: time.Hour}, 0); got != 30*time.Second {
+		t.Fatalf("bounded retry delay = %s, want 30s", got)
+	}
+	now := time.Date(2026, time.September, 2, 8, 0, 0, 0, time.UTC)
+	if got := parseRetryAfter("7", now); got != 7*time.Second {
+		t.Fatalf("delta Retry-After = %s, want 7s", got)
+	}
+	if got := parseRetryAfter(now.Add(9*time.Second).Format(gohttp.TimeFormat), now); got != 9*time.Second {
+		t.Fatalf("date Retry-After = %s, want 9s", got)
+	}
+}
+
+func TestFetcher_ReprobeExpansionReclaimsForbiddenWorkerChunk(t *testing.T) {
+	const (
+		validator = `"sequential-v1"`
+		prefixLen = 128 * 1024
+	)
+	payload := make([]byte, 4*1024*1024)
+	for i := range payload {
+		payload[i] = byte((i*11 + 7) % 251)
+	}
+	var rangeRequests atomic.Int32
+	var activeRange atomic.Bool
+	var forbiddenRequests atomic.Int32
+
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		w.Header().Set(base.HttpHeaderAcceptRanges, base.HttpHeaderBytes)
+		rangeHeader := r.Header.Get(base.HttpHeaderRange)
+		if rangeHeader == "" {
+			w.Header().Set(base.HttpHeaderETag, validator)
+			w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(payload)))
+			w.WriteHeader(gohttp.StatusOK)
+			w.(gohttp.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+
+		requestNumber := rangeRequests.Add(1)
+		if requestNumber == 1 {
+			w.Header().Set(base.HttpHeaderETag, validator)
+			w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(payload)))
+			w.WriteHeader(gohttp.StatusOK)
+			w.(gohttp.Flusher).Flush()
+			_, _ = w.Write(payload[:prefixLen])
+			return
+		}
+
+		if !activeRange.CompareAndSwap(false, true) {
+			forbiddenRequests.Add(1)
+			w.WriteHeader(gohttp.StatusForbidden)
+			return
+		}
+		defer activeRange.Store(false)
+
+		if got := r.Header.Get(base.HttpHeaderIfRange); got != validator {
+			t.Errorf("If-Range = %q, want %q", got, validator)
+		}
+		var start, end int64
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+			w.WriteHeader(gohttp.StatusBadRequest)
+			return
+		}
+		w.Header().Set(base.HttpHeaderContentRange,
+			fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", end-start+1))
+		w.WriteHeader(gohttp.StatusPartialContent)
+		w.(gohttp.Flusher).Flush()
+		for offset := start; offset <= end; offset += 8 * 1024 {
+			chunkEnd := min(offset+8*1024, end+1)
+			if _, err := w.Write(payload[offset:chunkEnd]); err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}))
+	defer server.Close()
+
+	f := buildFetcher()
+	if err := f.Resolve(&base.Request{URL: server.URL + "/limited.data"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "limited.data",
+		Extra: &http.OptsExtra{
+			Connections: 4,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if forbiddenRequests.Load() == 0 {
+		t.Fatal("test did not induce a worker 403")
+	}
+	got, err := os.ReadFile(f.meta.SingleFilepath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("download completed with an unfilled rejected-worker chunk")
+	}
+}
+
+func TestFetcher_ForbiddenWorkerRetriesAfterFastPrimaryReleasesSlot(t *testing.T) {
+	const validator = `"one-slot-v1"`
+	payload := make([]byte, 4*1024*1024)
+	for i := range payload {
+		payload[i] = byte((i*29 + 5) % 251)
+	}
+
+	var active atomic.Bool
+	var forbidden atomic.Int32
+	workerRejected := make(chan struct{})
+	var rejectedOnce sync.Once
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if !active.CompareAndSwap(false, true) {
+			forbidden.Add(1)
+			rejectedOnce.Do(func() { close(workerRejected) })
+			w.WriteHeader(gohttp.StatusForbidden)
+			return
+		}
+		defer active.Store(false)
+
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get(base.HttpHeaderRange), "bytes=%d-%d", &start, &end); err != nil {
+			w.WriteHeader(gohttp.StatusBadRequest)
+			return
+		}
+		w.Header().Set(base.HttpHeaderETag, validator)
+		w.Header().Set(base.HttpHeaderContentRange, fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", end-start+1))
+		w.WriteHeader(gohttp.StatusPartialContent)
+		w.(gohttp.Flusher).Flush()
+		if start == 0 {
+			select {
+			case <-workerRejected:
+			case <-time.After(2 * time.Second):
+				t.Error("worker did not overlap the primary connection")
+				return
+			}
+		}
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer server.Close()
+
+	f := &Fetcher{
+		meta: &fetcher.FetcherMeta{
+			Req: &base.Request{URL: server.URL, Extra: &http.ReqExtra{}},
+			Res: &base.Resource{
+				Size:  int64(len(payload)),
+				Range: true,
+				Files: []*base.FileInfo{{Name: "one-slot.data", Size: int64(len(payload))}},
+			},
+			Opts: &base.Options{Path: t.TempDir(), Name: "one-slot.data", Extra: &http.OptsExtra{Connections: 2}},
+		},
+		ifRange:              validator,
+		rangeValidatorPinned: true,
+	}
+	ctl := controller.NewController()
+	ctl.GetConfig = func(v any) {
+		_ = json.Unmarshal([]byte(test.ToJson(new(FetcherManager).DefaultConfig())), v)
+	}
+	f.Setup(ctl)
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if forbidden.Load() == 0 {
+		t.Fatal("test did not induce a connection-limit rejection")
+	}
+	got, err := os.ReadFile(f.meta.SingleFilepath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("download completed with an unfilled fast-primary worker chunk")
+	}
+}
+
+func TestFetcher_PauseDuringForbiddenBackoffCanResume(t *testing.T) {
+	const validator = `"resume-after-403-v1"`
+	payload := bytes.Repeat([]byte("resume-after-forbidden"), 32*1024)
+	var allow atomic.Bool
+	rejected := make(chan struct{}, 1)
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if !allow.Load() {
+			w.WriteHeader(gohttp.StatusForbidden)
+			select {
+			case rejected <- struct{}{}:
+			default:
+			}
+			return
+		}
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get(base.HttpHeaderRange), "bytes=%d-%d", &start, &end); err != nil {
+			w.WriteHeader(gohttp.StatusBadRequest)
+			return
+		}
+		w.Header().Set(base.HttpHeaderETag, validator)
+		w.Header().Set(base.HttpHeaderContentRange, fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", end-start+1))
+		w.WriteHeader(gohttp.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer server.Close()
+
+	f := &Fetcher{
+		meta: &fetcher.FetcherMeta{
+			Req:  &base.Request{URL: server.URL, Extra: &http.ReqExtra{}},
+			Res:  &base.Resource{Size: int64(len(payload)), Range: true, Files: []*base.FileInfo{{Name: "resume-403.data", Size: int64(len(payload))}}},
+			Opts: &base.Options{Path: t.TempDir(), Name: "resume-403.data", Extra: &http.OptsExtra{Connections: 1}},
+		},
+		ifRange:              validator,
+		rangeValidatorPinned: true,
+		connections: []*connection{{
+			ID:    0,
+			Role:  rolePrimary,
+			State: connNotStarted,
+			Chunk: newChunk(0, int64(len(payload))-1),
+		}},
+	}
+	ctl := controller.NewController()
+	ctl.GetConfig = func(v any) {
+		_ = json.Unmarshal([]byte(test.ToJson(new(FetcherManager).DefaultConfig())), v)
+	}
+	f.Setup(ctl)
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-rejected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection did not enter 403 backoff")
+	}
+	if err := f.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	allow.Store(true)
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(f.meta.SingleFilepath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("resumed 403 connection did not fill its assigned range")
+	}
+}
+
+func TestFetcher_ZeroByteSequentialInterruptionAcceptsNewSize(t *testing.T) {
+	resolvePayload := bytes.Repeat([]byte("resolve"), 256*1024)
+	ignoredRangePayload := bytes.Repeat([]byte("ignored"), 192*1024)
+	replacement := bytes.Repeat([]byte("replacement"), 128*1024)
+	var fullRequests atomic.Int32
+	var rangeRequests atomic.Int32
+
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		w.Header().Set(base.HttpHeaderAcceptRanges, base.HttpHeaderBytes)
+		if r.Header.Get(base.HttpHeaderRange) == "" {
+			w.Header().Set(base.HttpHeaderETag, `"resolve-v1"`)
+			requestNumber := fullRequests.Add(1)
+			responsePayload := resolvePayload
+			if requestNumber > 1 {
+				responsePayload = replacement
+			}
+			w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(responsePayload)))
+			w.WriteHeader(gohttp.StatusOK)
+			w.(gohttp.Flusher).Flush()
+			if requestNumber == 1 {
+				<-r.Context().Done()
+				return
+			}
+			_, _ = w.Write(responsePayload)
+			return
+		}
+
+		rangeRequests.Add(1)
+		w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(ignoredRangePayload)))
+		w.WriteHeader(gohttp.StatusOK)
+		w.(gohttp.Flusher).Flush()
+		// Returning without a body produces a zero-byte unexpected EOF.
+	}))
+	defer server.Close()
+
+	f := buildFetcher()
+	if err := f.Resolve(&base.Request{URL: server.URL + "/zero-byte.data"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "zero-byte.data",
+		Extra: &http.OptsExtra{
+			Connections: 2,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	if rangeRequests.Load() != 1 {
+		t.Fatalf("Range requests = %d, want 1", rangeRequests.Load())
+	}
+	if fullRequests.Load() < 2 {
+		t.Fatal("zero-byte interruption did not retry with a full request")
+	}
+	got, err := os.ReadFile(f.meta.SingleFilepath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, replacement) {
+		t.Fatal("zero-byte sequential retry did not accept the current representation")
+	}
+	wantSize := int64(len(replacement))
+	if f.meta.Res.Size != wantSize || f.meta.Res.Files[0].Size != wantSize {
+		t.Fatalf("resource size = %d/%d, want %d", f.meta.Res.Size, f.meta.Res.Files[0].Size, wantSize)
+	}
+}
+
+func TestFetcher_InitialUnknownLengthRetryTruncatesOldTail(t *testing.T) {
+	oldPrefix := bytes.Repeat([]byte("obsolete-prefix"), 32*1024)
+	replacement := bytes.Repeat([]byte("new"), 24*1024)
+	if len(replacement) >= len(oldPrefix) {
+		t.Fatal("replacement must be shorter than the interrupted prefix")
+	}
+	var requests atomic.Int32
+
+	server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		if requests.Add(1) == 1 {
+			conn, rw, err := w.(gohttp.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("Hijack() error = %v", err)
+				return
+			}
+			_, _ = fmt.Fprintf(rw, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n%x\r\n", len(oldPrefix))
+			_, _ = rw.Write(oldPrefix)
+			_, _ = rw.WriteString("\r\n")
+			_ = rw.Flush()
+			_ = conn.Close() // no terminating zero chunk: force unexpected EOF
+			return
+		}
+
+		w.WriteHeader(gohttp.StatusOK)
+		w.(gohttp.Flusher).Flush() // keep Content-Length unknown
+		_, _ = w.Write(replacement)
+	}))
+	defer server.Close()
+
+	f := buildFetcher()
+	if err := f.Resolve(&base.Request{URL: server.URL + "/unknown.data"}, &base.Options{
+		Path: t.TempDir(),
+		Name: "unknown.data",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err == nil {
+		t.Fatal("interrupted unknown-length response unexpectedly succeeded")
+	}
+	if !f.sequentialSizeUnknown || !f.sequentialRestartPending {
+		t.Fatalf("recovery state = unknown:%v pending:%v, want true/true", f.sequentialSizeUnknown, f.sequentialRestartPending)
+	}
+
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(f.meta.SingleFilepath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, replacement) {
+		t.Fatal("retry retained bytes from the interrupted unknown-length response")
+	}
+	wantSize := int64(len(replacement))
+	if f.meta.Res.Size != wantSize || f.meta.Res.Files[0].Size != wantSize {
+		t.Fatalf("final size = %d/%d, want %d", f.meta.Res.Size, f.meta.Res.Files[0].Size, wantSize)
+	}
+	if f.sequentialSizeUnknown || f.sequentialRestartPending {
+		t.Fatalf("completed recovery state = unknown:%v pending:%v", f.sequentialSizeUnknown, f.sequentialRestartPending)
+	}
+}
+
 func TestFetcher_InterruptedChunkedReplacementRestartsFromZero(t *testing.T) {
 	payload := bytes.Repeat([]byte("original"), 512*1024)
 	replacement := bytes.Repeat([]byte("replacement"), 256*1024)
@@ -907,6 +1474,9 @@ func TestFetcher_InterruptedChunkedReplacementRestartsFromZero(t *testing.T) {
 			if requestNumber > 1 {
 				responsePayload = replacement
 				sawFullRestart.Store(true)
+			}
+			if requestNumber == 1 {
+				w.Header().Set(base.HttpHeaderETag, `"resolve-v1"`)
 			}
 			w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", len(responsePayload)))
 			w.WriteHeader(gohttp.StatusOK)
@@ -995,7 +1565,8 @@ func TestFetcher_InterruptedChunkedReplacementRestartsFromZero(t *testing.T) {
 func TestExtractIfRangeValidator(t *testing.T) {
 	const (
 		lastModified = "Wed, 21 Oct 2015 07:28:00 GMT"
-		laterDate    = "Wed, 21 Oct 2015 07:28:02 GMT"
+		laterDate    = "Wed, 21 Oct 2015 07:30:00 GMT"
+		tooRecent    = "Wed, 21 Oct 2015 07:28:59 GMT"
 	)
 	tests := []struct {
 		name string
@@ -1008,6 +1579,7 @@ func TestExtractIfRangeValidator(t *testing.T) {
 		{name: "malformed ETag", etag: `"bad value"`},
 		{name: "weak ETag blocks date", etag: `W/"v1"`, lm: lastModified, date: laterDate},
 		{name: "strong Last-Modified", lm: lastModified, date: laterDate, want: lastModified},
+		{name: "Last-Modified less than sixty seconds old", lm: lastModified, date: tooRecent},
 		{name: "same-second Last-Modified", lm: lastModified, date: lastModified},
 		{name: "Last-Modified without Date", lm: lastModified},
 	}
@@ -1058,6 +1630,123 @@ func TestFetcher_OriginalURLFallbackPreservesResumeHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+}
+
+func TestFetcher_MidstreamRedirectFailureRefreshesFromOriginalURL(t *testing.T) {
+	const validator = `"redirect-v1"`
+	payload := make([]byte, 512*1024)
+	for i := range payload {
+		payload[i] = byte((i*17 + 3) % 251)
+	}
+
+	var tempRequests atomic.Int32
+	temp := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get(base.HttpHeaderRange), "bytes=%d-%d", &start, &end); err != nil {
+			t.Errorf("temporary URL Range = %q", r.Header.Get(base.HttpHeaderRange))
+			w.WriteHeader(gohttp.StatusBadRequest)
+			return
+		}
+		if got := r.Header.Get(base.HttpHeaderIfRange); got != validator {
+			t.Errorf("temporary URL If-Range = %q, want %q", got, validator)
+		}
+		w.Header().Set(base.HttpHeaderETag, validator)
+		w.Header().Set(base.HttpHeaderContentRange, fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set(base.HttpHeaderContentLength, fmt.Sprintf("%d", end-start+1))
+		w.WriteHeader(gohttp.StatusPartialContent)
+		if tempRequests.Add(1) == 1 {
+			_, _ = w.Write(payload[start : start+32*1024])
+			return
+		}
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer temp.Close()
+
+	var originalRequests atomic.Int32
+	original := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, r *gohttp.Request) {
+		originalRequests.Add(1)
+		if got := r.Header.Get(base.HttpHeaderIfRange); got != validator {
+			t.Errorf("original URL If-Range = %q, want %q", got, validator)
+		}
+		gohttp.Redirect(w, r, temp.URL, gohttp.StatusFound)
+	}))
+	defer original.Close()
+
+	path := t.TempDir()
+	f := &Fetcher{
+		meta: &fetcher.FetcherMeta{
+			Req: &base.Request{URL: original.URL, Extra: &http.ReqExtra{}},
+			Res: &base.Resource{
+				Size:  int64(len(payload)),
+				Range: true,
+				Files: []*base.FileInfo{{Name: "redirect.data", Size: int64(len(payload))}},
+			},
+			Opts: &base.Options{Path: path, Name: "redirect.data", Extra: &http.OptsExtra{Connections: 1}},
+		},
+		ifRange:              validator,
+		rangeValidatorPinned: true,
+		redirectURL:          temp.URL,
+	}
+	ctl := controller.NewController()
+	ctl.GetConfig = func(v any) {
+		_ = json.Unmarshal([]byte(test.ToJson(new(FetcherManager).DefaultConfig())), v)
+	}
+	f.Setup(ctl)
+	if err := f.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if tempRequests.Load() < 2 || originalRequests.Load() == 0 {
+		t.Fatalf("requests temporary/original = %d/%d, want retry through original", tempRequests.Load(), originalRequests.Load())
+	}
+	got, err := os.ReadFile(f.meta.SingleFilepath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("download after midstream redirect failure differs from source")
+	}
+}
+
+func TestFetcher_PersistentTemporaryStatusStopsAfterBoundedRetries(t *testing.T) {
+	for _, status := range []int{gohttp.StatusTooManyRequests, gohttp.StatusServiceUnavailable} {
+		t.Run(gohttp.StatusText(status), func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, _ *gohttp.Request) {
+				requests.Add(1)
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			f := &Fetcher{
+				meta: &fetcher.FetcherMeta{
+					Req:  &base.Request{URL: server.URL, Extra: &http.ReqExtra{}},
+					Res:  &base.Resource{Size: 1024, Range: true, Files: []*base.FileInfo{{Name: "retry.data", Size: 1024}}},
+					Opts: &base.Options{Path: t.TempDir(), Name: "retry.data", Extra: &http.OptsExtra{Connections: 1}},
+				},
+				ifRange:              `"retry-v1"`,
+				rangeValidatorPinned: true,
+			}
+			ctl := controller.NewController()
+			ctl.GetConfig = func(v any) {
+				_ = json.Unmarshal([]byte(test.ToJson(new(FetcherManager).DefaultConfig())), v)
+			}
+			f.Setup(ctl)
+			if err := f.Start(); err != nil {
+				t.Fatal(err)
+			}
+			err := f.Wait()
+			requestErr := extractRequestError(err)
+			if requestErr == nil || requestErr.Code != status {
+				t.Fatalf("Wait error = %v, want HTTP %d", err, status)
+			}
+			if got := requests.Load(); got != 3 {
+				t.Fatalf("requests = %d, want 3 bounded attempts", got)
+			}
+		})
+	}
 }
 
 func TestFetcher_RejectsInvalidPartialContent(t *testing.T) {
@@ -1456,6 +2145,38 @@ func TestFetcher_Download500Recovery(t *testing.T) {
 		if conn.RetryTimes != 0 {
 			t.Errorf("Expected retryTimes to be 0 for 500 errors (exempt), got %d", conn.RetryTimes)
 		}
+	}
+}
+
+func TestSlowStartMixedBatchAlwaysSignalsExpansion(t *testing.T) {
+	orders := []struct {
+		name       string
+		firstFails bool
+	}{
+		{name: "success then failure"},
+		{name: "failure then success", firstFails: true},
+	}
+	for _, tc := range orders {
+		t.Run(tc.name, func(t *testing.T) {
+			slowStart := newSlowStartController(2)
+			slowStart.commitBatch(2)
+			if tc.firstFails {
+				slowStart.onConnectFailed()
+				if slowStart.onConnectSuccess() != true {
+					t.Fatal("mixed batch did not settle after its successful response")
+				}
+			} else {
+				if slowStart.onConnectSuccess() {
+					t.Fatal("batch settled before its failed response arrived")
+				}
+				slowStart.onConnectFailed()
+			}
+			select {
+			case <-slowStart.expansionCh:
+			default:
+				t.Fatal("mixed batch lost its expansion signal")
+			}
+		})
 	}
 }
 
@@ -2087,6 +2808,7 @@ func TestFetcherManager_StoreCreatesAtomicSnapshot(t *testing.T) {
 				f.rangeReprobeEligible = true
 				f.rangeValidatorPinned = false
 				f.sequentialSizeUnknown = true
+				f.sequentialRestartPending = true
 				f.connections[0].Downloaded = 64
 				f.connections[0].Chunk.Downloaded = 64
 			} else {
@@ -2096,6 +2818,7 @@ func TestFetcherManager_StoreCreatesAtomicSnapshot(t *testing.T) {
 				f.rangeReprobeEligible = false
 				f.rangeValidatorPinned = true
 				f.sequentialSizeUnknown = false
+				f.sequentialRestartPending = false
 				f.connections[0].Downloaded = 0
 				f.connections[0].Chunk.Downloaded = 0
 			}
@@ -2135,12 +2858,12 @@ func TestFetcherManager_StoreCreatesAtomicSnapshot(t *testing.T) {
 
 		downloaded := fd.Connections[0].Chunk.Downloaded
 		if *fd.Range {
-			if fd.RangeReprobeEligible || !fd.RangeValidatorPinned || fd.SequentialSizeUnknown || downloaded != 0 || *fd.ResourceSize != 100 || *fd.FileSize != 100 {
+			if fd.RangeReprobeEligible || !fd.RangeValidatorPinned || fd.SequentialSizeUnknown || fd.SequentialRestartPending || downloaded != 0 || *fd.ResourceSize != 100 || *fd.FileSize != 100 {
 				close(stop)
 				<-done
 				t.Fatalf("mixed ranged snapshot: eligible=%v pinned=%v unknown=%v downloaded=%d size=%d/%d", fd.RangeReprobeEligible, fd.RangeValidatorPinned, fd.SequentialSizeUnknown, downloaded, *fd.ResourceSize, *fd.FileSize)
 			}
-		} else if !fd.RangeReprobeEligible || fd.RangeValidatorPinned || !fd.SequentialSizeUnknown || downloaded != 64 || *fd.ResourceSize != 0 || *fd.FileSize != 0 {
+		} else if !fd.RangeReprobeEligible || fd.RangeValidatorPinned || !fd.SequentialSizeUnknown || !fd.SequentialRestartPending || downloaded != 64 || *fd.ResourceSize != 0 || *fd.FileSize != 0 {
 			close(stop)
 			<-done
 			t.Fatalf("mixed sequential snapshot: eligible=%v pinned=%v unknown=%v downloaded=%d size=%d/%d", fd.RangeReprobeEligible, fd.RangeValidatorPinned, fd.SequentialSizeUnknown, downloaded, *fd.ResourceSize, *fd.FileSize)
@@ -2163,12 +2886,14 @@ func TestFetcherManager_RestoreUsesSnapshotRangeMode(t *testing.T) {
 			Chunk:      &chunk{Begin: 0, End: 99, Downloaded: 64},
 			Downloaded: 64,
 		}},
-		IfRange:               `"snapshot-v1"`,
-		RangeReprobeEligible:  true,
-		SequentialSizeUnknown: true,
-		Range:                 &rangeMode,
-		ResourceSize:          &resourceSize,
-		FileSize:              &fileSize,
+		IfRange:                  `"snapshot-v1"`,
+		RangeReprobeEligible:     true,
+		SequentialSizeUnknown:    true,
+		SequentialRestartPending: true,
+		RecoveryGeneration:       7,
+		Range:                    &rangeMode,
+		ResourceSize:             &resourceSize,
+		FileSize:                 &fileSize,
 	}
 	encoded, err := json.Marshal(saved)
 	if err != nil {
@@ -2193,7 +2918,7 @@ func TestFetcherManager_RestoreUsesSnapshotRangeMode(t *testing.T) {
 	if restored.meta.Res.Range {
 		t.Fatal("Restore kept stale task Range mode instead of the connection snapshot mode")
 	}
-	if !restored.rangeReprobeEligible || !restored.sequentialSizeUnknown || restored.ifRange != `"snapshot-v1"` {
+	if !restored.rangeReprobeEligible || !restored.sequentialSizeUnknown || !restored.sequentialRestartPending || restored.ifRange != `"snapshot-v1"` {
 		t.Fatalf("restored recovery state = eligible:%v unknown:%v If-Range:%q", restored.rangeReprobeEligible, restored.sequentialSizeUnknown, restored.ifRange)
 	}
 	if restored.meta.Res.Size != 0 || restored.meta.Res.Files[0].Size != 0 {
@@ -2201,6 +2926,9 @@ func TestFetcherManager_RestoreUsesSnapshotRangeMode(t *testing.T) {
 	}
 	if got := restored.connections[0].Chunk.Downloaded; got != 64 {
 		t.Fatalf("restored prefix = %d, want 64", got)
+	}
+	if got := restored.RecoveryGeneration(); got != 7 {
+		t.Fatalf("restored generation = %d, want 7", got)
 	}
 	restored.connMu.Lock()
 	canProbe := restored.canProbeSequentialResumeLocked(restored.connections[0])
@@ -2232,9 +2960,147 @@ func TestFetcherManager_RestoreUsesSnapshotRangeMode(t *testing.T) {
 		Opts: &base.Options{},
 	}
 	legacy := restore(legacyMeta, &fetcherData{}).(*Fetcher)
-	if !legacy.meta.Res.Range {
-		t.Fatal("legacy record unexpectedly overrode task Range mode")
+	if legacy.meta.Res.Range || !legacy.sequentialRestartPending || len(legacy.connections) != 0 {
+		t.Fatal("legacy unvalidated ranged record was not forced to restart safely")
 	}
+
+	missingSequentialMeta := &fetcher.FetcherMeta{
+		Req:  &base.Request{},
+		Res:  &base.Resource{Size: 64, Range: false, Files: []*base.FileInfo{{Size: 64}}},
+		Opts: &base.Options{},
+	}
+	missingSequential := restore(missingSequentialMeta, &fetcherData{}).(*Fetcher)
+	if !missingSequential.sequentialRestartPending || len(missingSequential.connections) != 0 {
+		t.Fatal("missing sequential checkpoint did not force a full-response restart")
+	}
+}
+
+func TestFetcherManager_StoreSeesCompleteSequentialTransition(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "sequential-transition-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := file.Truncate(256); err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &connection{
+		ID:         0,
+		Role:       rolePrimary,
+		State:      connDownloading,
+		Chunk:      newChunk(128, 255),
+		Downloaded: 128,
+	}
+	f := &Fetcher{
+		meta: &fetcher.FetcherMeta{
+			Req: &base.Request{},
+			Res: &base.Resource{
+				Size:  256,
+				Range: true,
+				Files: []*base.FileInfo{{Size: 256}},
+			},
+			Opts: &base.Options{},
+		},
+		file:                 file,
+		connections:          []*connection{conn},
+		ifRange:              `"old-v1"`,
+		rangeValidatorPinned: true,
+	}
+	ctl := controller.NewController()
+	var invalidated atomic.Bool
+	ctl.InvalidateResumeState = func() error {
+		if got := f.RecoveryGeneration(); got != 1 {
+			t.Fatalf("generation during invalidation = %d, want 1", got)
+		}
+		info, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		if info.Size() != 256 {
+			t.Fatalf("file changed before checkpoint invalidation: size=%d, want 256", info.Size())
+		}
+		invalidated.Store(true)
+		return nil
+	}
+	f.ctl = ctl
+	if err := f.beginSequentialResponse(conn, `"new-v2"`, 384, true); err != nil {
+		t.Fatal(err)
+	}
+	if !invalidated.Load() {
+		t.Fatal("destructive transition did not invalidate the durable checkpoint")
+	}
+
+	data, err := new(FetcherManager).Store(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := data.(*fetcherData)
+	if fd.Range == nil || *fd.Range {
+		t.Fatalf("snapshot range mode = %v, want sequential", fd.Range)
+	}
+	if fd.ResourceSize == nil || fd.FileSize == nil || *fd.ResourceSize != 384 || *fd.FileSize != 384 {
+		t.Fatalf("snapshot size = %v/%v, want 384/384", fd.ResourceSize, fd.FileSize)
+	}
+	if !fd.RangeReprobeEligible || fd.RangeValidatorPinned || fd.SequentialSizeUnknown || !fd.SequentialRestartPending {
+		t.Fatalf("snapshot recovery state = eligible:%v pinned:%v unknown:%v pending:%v",
+			fd.RangeReprobeEligible, fd.RangeValidatorPinned, fd.SequentialSizeUnknown, fd.SequentialRestartPending)
+	}
+	if fd.RecoveryGeneration != 1 {
+		t.Fatalf("snapshot generation = %d, want 1", fd.RecoveryGeneration)
+	}
+	if len(fd.Connections) != 1 || fd.Connections[0].Downloaded != 0 || fd.Connections[0].Chunk.Downloaded != 0 {
+		t.Fatalf("snapshot counters were not reset: %#v", fd.Connections)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 384 {
+		t.Fatalf("target size = %d, want 384", info.Size())
+	}
+}
+
+func TestFetcher_MetaSnapshotKeepsDynamicSizesCoherent(t *testing.T) {
+	f := &Fetcher{meta: &fetcher.FetcherMeta{
+		Req:  &base.Request{},
+		Res:  &base.Resource{Size: 100, Files: []*base.FileInfo{{Size: 100}}},
+		Opts: &base.Options{},
+	}}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var size int64 = 100
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			f.connMu.Lock()
+			f.meta.Res.Size = size
+			f.meta.Res.Files[0].Size = size
+			f.connMu.Unlock()
+			if size == 100 {
+				size = 200
+			} else {
+				size = 100
+			}
+		}
+	}()
+
+	for i := 0; i < 1000; i++ {
+		snapshot := f.MetaSnapshot()
+		if snapshot.Res.Size != snapshot.Res.Files[0].Size {
+			close(stop)
+			<-done
+			t.Fatalf("mixed metadata snapshot: %d/%d", snapshot.Res.Size, snapshot.Res.Files[0].Size)
+		}
+	}
+	close(stop)
+	<-done
 }
 
 func TestFetcherManager_RestoreUsesAtomicSizeSnapshotForDownload(t *testing.T) {

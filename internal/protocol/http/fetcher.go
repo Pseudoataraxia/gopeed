@@ -20,6 +20,7 @@ import (
 	"github.com/GopeedLab/gopeed/internal/httpclient"
 	"github.com/GopeedLab/gopeed/pkg/base"
 	fhttp "github.com/GopeedLab/gopeed/pkg/protocol/http"
+	"github.com/GopeedLab/gopeed/pkg/util"
 	"github.com/xiaoqidun/setft"
 )
 
@@ -45,6 +46,40 @@ func isRangeIntegrityError(err error) bool {
 
 func isTerminalRangeError(err error) bool {
 	return isRangeIntegrityError(err)
+}
+
+func isConnectionLimitFailure(conn *connection) bool {
+	if conn == nil || conn.State != connFailed || !conn.failed {
+		return false
+	}
+	re := extractRequestError(conn.lastErr)
+	return re != nil && re.Code == http.StatusForbidden
+}
+
+func maxConnectionAttempts(err error) int {
+	if re := extractRequestError(err); re != nil && re.Code >= 500 && re.Code <= 599 && re.Code != http.StatusServiceUnavailable {
+		// Ordinary gateway/server failures often clear after several seconds. Keep
+		// a finite 15-second backoff window while treating explicit overload (503)
+		// and rate limiting (429) as shorter bounded attempts.
+		return 6
+	}
+	return 3
+}
+
+func connectionRetryDelay(err error, retries int) time.Duration {
+	delay := time.Second * time.Duration(retries+1)
+	if delay > 5*time.Second {
+		delay = 5 * time.Second
+	}
+	if requestErr := extractRequestError(err); requestErr != nil && requestErr.RetryAfter > delay {
+		delay = requestErr.RetryAfter
+	}
+	// Keep even a malicious or mistaken Retry-After within a finite task-level
+	// recovery window. The attempt cap remains authoritative.
+	if delay > 30*time.Second {
+		delay = 30 * time.Second
+	}
+	return delay
 }
 
 // ============================================================================
@@ -111,10 +146,11 @@ type connection struct {
 	Downloaded int64
 	Completed  bool
 
-	failed     bool
-	exited     bool
-	retryTimes int
-	lastErr    error
+	failed        bool
+	exited        bool
+	batchReported bool
+	retryTimes    int
+	lastErr       error
 
 	// Speed tracking for work stealing decisions
 	speed             int64 // bytes per second
@@ -175,9 +211,11 @@ func (s *slowStartController) onConnectFailed() {
 	if s.batchPending > 0 {
 		s.batchPending--
 	}
-	// If all pending resolved (success or fail), trigger expansion
-	// This handles both successful completion and all-failures case
-	if s.batchPending == 0 {
+	// Successful responses are counted in batchReady while failures reduce the
+	// number of successes still required. Wake when the two meet. Checking only
+	// for zero loses the signal for a mixed batch (for example one success and
+	// one failure), leaving the scheduler asleep after every worker has exited.
+	if s.batchReady >= s.batchPending {
 		select {
 		case s.expansionCh <- struct{}{}:
 		default:
@@ -271,19 +309,22 @@ type Fetcher struct {
 	prefetchFile     *os.File      // Temporary file for prefetch data
 	prefetchFilePath string        // Path to temporary file
 	prefetchSize     atomic.Int64  // Bytes prefetched so far
-	prefetchDone     atomic.Bool   // Prefetch completed or stopped
 	prefetchErr      error         // Error during prefetch (if any)
 	prefetchStopCh   chan struct{} // Signal to stop prefetch
+	prefetchDoneCh   chan struct{} // Closed after the prefetch goroutine exits
+	prefetchStopOnce sync.Once     // Makes concurrent stop requests safe
 
 	// Target file
-	file                  *os.File
-	fileMu                sync.Mutex
-	redirectURL           string
-	redirectLock          sync.Mutex
-	ifRange               string
-	rangeReprobeEligible  bool
-	rangeValidatorPinned  bool
-	sequentialSizeUnknown bool
+	file                     *os.File
+	fileMu                   sync.Mutex
+	redirectURL              string
+	redirectLock             sync.Mutex
+	ifRange                  string
+	rangeReprobeEligible     bool
+	rangeValidatorPinned     bool
+	sequentialSizeUnknown    bool
+	sequentialRestartPending bool
+	recoveryGeneration       atomic.Uint64
 
 	// Lifecycle control
 	ctx    context.Context
@@ -329,6 +370,41 @@ func (f *Fetcher) setState(s fetcherState) {
 	f.state.Store(int32(s))
 }
 
+// reportBatchResult settles a slow-start slot exactly once. Retries belong to
+// the same launched connection and must not decrement the batch repeatedly.
+func (f *Fetcher) reportBatchResult(conn *connection, success bool) {
+	if f.slowStart == nil || conn == nil {
+		return
+	}
+	f.connMu.Lock()
+	if conn.batchReported {
+		f.connMu.Unlock()
+		return
+	}
+	conn.batchReported = true
+	f.connMu.Unlock()
+	if success {
+		f.slowStart.onConnectSuccess()
+	} else {
+		f.slowStart.onConnectFailed()
+	}
+}
+
+// hasOtherDownloadingConnection reports whether a 403 is plausibly a
+// per-origin connection limit rather than a permanent denial. Such a worker
+// keeps retrying while a healthy peer occupies the available slot, then gets a
+// bounded set of attempts once that peer finishes.
+func (f *Fetcher) hasOtherDownloadingConnection(conn *connection) bool {
+	f.connMu.Lock()
+	defer f.connMu.Unlock()
+	for _, other := range f.connections {
+		if other != conn && !other.Completed && other.State == connDownloading {
+			return true
+		}
+	}
+	return false
+}
+
 // updateMaxConnTime updates maxConnTime if the new duration is larger
 func (f *Fetcher) updateMaxConnTime(d time.Duration) {
 	newVal := int64(d)
@@ -371,6 +447,10 @@ func (f *Fetcher) Resolve(req *base.Request, opts *base.Options) error {
 		f.setState(stateError)
 		return err
 	}
+	// Resolve is an authoritative full-resource probe even when extensions or
+	// API callers supplied Range headers on the reusable request object.
+	httpReq.Header.Del(base.HttpHeaderRange)
+	httpReq.Header.Del(base.HttpHeaderIfRange)
 
 	client := f.buildClient()
 
@@ -391,10 +471,18 @@ func (f *Fetcher) Resolve(req *base.Request, opts *base.Options) error {
 		Files: []*base.FileInfo{},
 	}
 
-	if resp.StatusCode != base.HttpCodeOK && resp.StatusCode != base.HttpCodePartialContent {
+	// Resolve deliberately sends no Range header, so a partial response cannot
+	// describe the whole resource. Treat unsolicited 206 as malformed instead
+	// of mistaking its Content-Length for the total file size.
+	if resp.StatusCode == base.HttpCodePartialContent {
 		resp.Body.Close()
 		f.setState(stateError)
-		return NewRequestError(resp.StatusCode)
+		return fmt.Errorf("%w: unsolicited 206 response to full request", errInvalidRangeResponse)
+	}
+	if resp.StatusCode != base.HttpCodeOK {
+		resp.Body.Close()
+		f.setState(stateError)
+		return newResponseRequestError(resp)
 	}
 
 	// Check if server supports range requests
@@ -422,6 +510,14 @@ func (f *Fetcher) Resolve(req *base.Request, opts *base.Options) error {
 		}
 	}
 	f.ifRange = extractIfRangeValidator(resp.Header)
+	// Multiple HTTP responses may be assembled only when they can all be pinned
+	// to one representation. Without a strong validator, retain this original
+	// full response and consume it sequentially instead of issuing parallel
+	// unguarded Range requests that could silently mix same-sized versions.
+	f.rangeValidatorPinned = f.ifRange != ""
+	if res.Range && !f.rangeValidatorPinned {
+		res.Range = false
+	}
 
 	file := &base.FileInfo{
 		Size:  res.Size,
@@ -467,6 +563,7 @@ func (f *Fetcher) Resolve(req *base.Request, opts *base.Options) error {
 	// For non-range resources, the response will be used directly in Start
 	if res.Range && res.Size > 0 {
 		f.prefetchStopCh = make(chan struct{})
+		f.prefetchDoneCh = make(chan struct{})
 		go f.asyncPrefetch()
 	}
 
@@ -481,9 +578,7 @@ func (f *Fetcher) Resolve(req *base.Request, opts *base.Options) error {
 // asyncPrefetch downloads data in background during resolve phase
 // This data can be reused when Start is called to save time
 func (f *Fetcher) asyncPrefetch() {
-	defer func() {
-		f.prefetchDone.Store(true)
-	}()
+	defer close(f.prefetchDoneCh)
 
 	// Get the resolve response
 	f.resolveRespLock.Lock()
@@ -547,20 +642,7 @@ func (f *Fetcher) asyncPrefetch() {
 // stopPrefetchAndGetData stops the async prefetch and returns prefetched bytes
 // It also copies prefetched data to the target file
 func (f *Fetcher) stopPrefetchAndCopyData() int64 {
-	// Signal prefetch to stop (safely)
-	if f.prefetchStopCh != nil {
-		select {
-		case <-f.prefetchStopCh:
-			// Already closed
-		default:
-			close(f.prefetchStopCh)
-		}
-	}
-
-	// Wait for prefetch to finish (with timeout)
-	for i := 0; i < 1000 && !f.prefetchDone.Load(); i++ {
-		time.Sleep(10 * time.Millisecond)
-	}
+	f.stopAsyncPrefetch()
 
 	prefetched := f.prefetchSize.Load()
 	if prefetched == 0 {
@@ -590,6 +672,30 @@ func (f *Fetcher) stopPrefetchAndCopyData() int64 {
 
 	f.cleanupPrefetchFile()
 	return prefetched
+}
+
+// stopAsyncPrefetch interrupts a blocked body read and waits until the worker
+// has published all temporary-file state. A fixed timeout could race cleanup
+// against a worker that had not created its file yet.
+func (f *Fetcher) stopAsyncPrefetch() {
+	if f.prefetchStopCh != nil {
+		f.prefetchStopOnce.Do(func() {
+			close(f.prefetchStopCh)
+		})
+	}
+
+	// A stop-channel signal cannot interrupt a Read already blocked in the HTTP
+	// body, but closing that body can.
+	f.resolveRespLock.Lock()
+	if f.resolveResp != nil {
+		_ = f.resolveResp.Body.Close()
+		f.resolveResp = nil
+	}
+	f.resolveRespLock.Unlock()
+
+	if f.prefetchDoneCh != nil {
+		<-f.prefetchDoneCh
+	}
 }
 
 // cleanupPrefetchFile closes and removes the prefetch temporary file
@@ -664,6 +770,7 @@ func (f *Fetcher) doStart() error {
 				}
 				conn.State = connNotStarted
 				conn.failed = false
+				conn.batchReported = false
 				conn.retryTimes = 0
 				conn.lastErr = nil
 			}
@@ -698,6 +805,15 @@ func (f *Fetcher) doStart() error {
 	if f.meta.Res.Range {
 		// Stop async prefetch and copy data to target file
 		prefetchedBytes = f.stopPrefetchAndCopyData()
+		f.connMu.Lock()
+		canReusePrefetch := f.rangeValidatorPinned && f.ifRange != ""
+		f.connMu.Unlock()
+		if prefetchedBytes > 0 && !canReusePrefetch {
+			// Without a validator there is no proof that a later Range response
+			// still belongs to the representation that produced this prefix.
+			// Start at zero so every byte comes from one response lineage.
+			prefetchedBytes = 0
+		}
 		f.resolveDataPos.Store(prefetchedBytes)
 
 		// Also close resolve response if still open
@@ -733,6 +849,7 @@ func (f *Fetcher) doStart() error {
 
 func (f *Fetcher) downloadLoop() {
 	ctx := f.ctx
+	loopDone := f.downloadLoopDone
 
 	defer func() {
 		// Update file last modified time before closing
@@ -741,8 +858,8 @@ func (f *Fetcher) downloadLoop() {
 		}
 
 		// Signal that downloadLoop has exited
-		if f.downloadLoopDone != nil {
-			close(f.downloadLoopDone)
+		if loopDone != nil {
+			close(loopDone)
 		}
 	}()
 
@@ -989,9 +1106,16 @@ func (f *Fetcher) runConnection(conn *connection) {
 	buf := make([]byte, 8192)
 
 	retries := 0
+	f.connMu.Lock()
 	conn.retryTimes = 0
+	f.connMu.Unlock()
 
 	for {
+		f.connMu.Lock()
+		conn.State = connConnecting
+		conn.failed = false
+		f.connMu.Unlock()
+
 		// Rebuild client with updated fast-fail timeout on retries
 		if retries > 0 {
 			client = f.buildFastFailClient()
@@ -1008,6 +1132,10 @@ func (f *Fetcher) runConnection(conn *connection) {
 
 		err := f.downloadChunkOnce(conn, client, buf)
 		if err == nil {
+			f.connMu.Lock()
+			conn.retryTimes = 0
+			conn.lastErr = nil
+			f.connMu.Unlock()
 			if !f.meta.Res.Range || !f.helpOtherConnection(conn) {
 				f.connMu.Lock()
 				conn.Completed = true
@@ -1018,7 +1146,9 @@ func (f *Fetcher) runConnection(conn *connection) {
 
 			// Reset counters after a successful help switch
 			retries = 0
+			f.connMu.Lock()
 			conn.retryTimes = 0
+			f.connMu.Unlock()
 			continue
 		}
 
@@ -1031,53 +1161,46 @@ func (f *Fetcher) runConnection(conn *connection) {
 			conn.State = connFailed
 			conn.failed = true
 			f.connMu.Unlock()
-			if f.slowStart != nil {
-				f.slowStart.onConnectFailed()
-			}
+			f.reportBatchResult(conn, false)
 			return
 		}
 
+		storedErr := err
 		if re := extractRequestError(err); re != nil {
-			conn.lastErr = re
-		} else {
-			conn.lastErr = err
+			storedErr = re
 		}
-
-		if shouldCountHTTPFailure(err) {
-			if re := extractRequestError(err); re != nil && re.Code == 403 {
-				f.connMu.Lock()
-				conn.State = connFailed
-				conn.failed = true
-				f.connMu.Unlock()
-				if f.slowStart != nil {
-					f.slowStart.onConnectFailed()
-				}
-				return
-			}
-			conn.retryTimes++
-			f.connMu.Lock()
-			conn.failed = true
-			f.connMu.Unlock()
-			if f.slowStart != nil {
-				f.slowStart.onConnectFailed()
-			}
-			if conn.retryTimes >= 3 {
-				f.connMu.Lock()
-				conn.State = connFailed
-				f.connMu.Unlock()
-				return
-			}
+		// A cached signed redirect can expire by resetting an established body,
+		// without ever returning an HTTP status. Retry the original URL next.
+		if extractRequestError(err) == nil && f.hasRedirectURL() {
+			f.updateRedirectURL("")
+		}
+		deferConnectionLimit := false
+		if re := extractRequestError(err); re != nil && re.Code == http.StatusForbidden {
+			deferConnectionLimit = f.hasOtherDownloadingConnection(conn)
 		}
 
 		f.connMu.Lock()
+		conn.lastErr = storedErr
 		conn.State = connFailed
-		f.connMu.Unlock()
-		retryDelay := time.Second * time.Duration(retries+1)
-		if retryDelay > 5*time.Second {
-			retryDelay = 5 * time.Second
+		conn.failed = true
+		if !deferConnectionLimit {
+			conn.retryTimes++
 		}
+		exhausted := conn.retryTimes >= maxConnectionAttempts(err)
+		f.connMu.Unlock()
+		if exhausted {
+			f.reportBatchResult(conn, false)
+			return
+		}
+		retryDelay := connectionRetryDelay(err, retries)
 		retries++
-		time.Sleep(retryDelay)
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-conn.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 
@@ -1094,13 +1217,15 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 	// the request; the returned full response will overwrite from byte zero.
 	f.connMu.Lock()
 	sequentialSizeUnknown := f.sequentialSizeUnknown
+	sequentialRestartPending := f.sequentialRestartPending
 	hasSequentialPrefix := f.hasSequentialPrefixLocked(conn)
 	resumeProbe := f.canProbeSequentialResumeLocked(conn)
-	intentionalRestart := sequentialSizeUnknown
-	if sequentialSizeUnknown || (hasSequentialPrefix && !resumeProbe) {
+	intentionalRestart := sequentialSizeUnknown || sequentialRestartPending
+	if intentionalRestart || (hasSequentialPrefix && !resumeProbe) {
 		f.resetConnectionForRestart(conn)
 		f.resolveDataPos.Store(0)
 		f.rangeValidatorPinned = false
+		f.sequentialRestartPending = true
 		intentionalRestart = true
 	}
 	if f.meta.Res.Range && conn.Chunk.remain() <= 0 {
@@ -1143,7 +1268,7 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 
 	if resp.StatusCode != base.HttpCodeOK && resp.StatusCode != base.HttpCodePartialContent {
 		resp.Body.Close()
-		originalErr := NewRequestError(resp.StatusCode)
+		originalErr := newResponseRequestError(resp)
 
 		// Check if this might be a redirect URL expiration error
 		// If so, try falling back to the original URL
@@ -1169,19 +1294,20 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 	}
 
 	expectedResponseLength := int64(-1)
-	if rangeRequested && resp.StatusCode == base.HttpCodeOK {
-		if resumeProbe {
-			// If-Range returning 200 provides the complete current representation.
-			// Discard the old prefix counters and consume this response from byte 0.
-			f.restartSequentialDownload(conn, extractIfRangeValidator(resp.Header))
-			intentionalRestart = true
-		} else {
-			if err := f.fallbackToSequentialDownload(conn, extractIfRangeValidator(resp.Header)); err != nil {
-				resp.Body.Close()
+	if resp.StatusCode == base.HttpCodeOK && (rangeRequested || intentionalRestart) {
+		// A Range fallback, an If-Range replacement, and a persisted restart all
+		// consume an authoritative full response from byte zero. Commit the mode,
+		// counters, file truncation, and sizes together so Store cannot observe a
+		// half-transitioned recovery state.
+		requireInitialRange := rangeRequested && !resumeProbe
+		if err := f.beginSequentialResponse(conn, extractIfRangeValidator(resp.Header), resp.ContentLength, requireInitialRange); err != nil {
+			resp.Body.Close()
+			if rangeRequested {
 				return fmt.Errorf("%w: expected 206 Partial Content, got 200 OK", err)
 			}
-			intentionalRestart = true
+			return err
 		}
+		intentionalRestart = true
 	}
 	if rangeRequested && resp.StatusCode == base.HttpCodePartialContent {
 		expectedResponseLength, err = validateRangeResponse(resp, rangeStart, rangeEnd, f.meta.Res.Size)
@@ -1197,9 +1323,16 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 			f.rangeReprobeEligible = false
 			f.rangeValidatorPinned = true
 			f.sequentialSizeUnknown = false
+			f.sequentialRestartPending = false
 			conn.Chunk.Begin = 0
 			conn.Chunk.End = f.meta.Res.Size - 1
 			f.connMu.Unlock()
+			// The first sequential 200 already settled this connection's original
+			// slow-start slot. Recovered Range mode is a distinct state transition
+			// that must wake the expansion loop explicitly.
+			if f.slowStart != nil {
+				f.slowStart.signalExpansion()
+			}
 		}
 	}
 	if !rangeRequested && resp.StatusCode == base.HttpCodeOK {
@@ -1214,14 +1347,7 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 	if !f.meta.Res.Range && resp.StatusCode == base.HttpCodeOK {
 		if intentionalRestart {
 			if resp.ContentLength >= 0 {
-				if err := f.resizeSequentialResource(resp.ContentLength); err != nil {
-					resp.Body.Close()
-					return err
-				}
 				expectedResponseLength = resp.ContentLength
-			} else if err := f.beginUnknownSizeSequentialResource(); err != nil {
-				resp.Body.Close()
-				return err
 			}
 		} else if f.meta.Res.Size > 0 {
 			expectedResponseLength = f.meta.Res.Size
@@ -1246,9 +1372,7 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 			close(f.primaryReadyCh)
 		})
 	}
-	if f.slowStart != nil {
-		f.slowStart.onConnectSuccess()
-	}
+	f.reportBatchResult(conn, true)
 
 	reader := NewTimeoutReader(resp.Body, readTimeout)
 	var responseBytesRead int64
@@ -1300,6 +1424,10 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 			f.connMu.Lock()
 			conn.Chunk.Downloaded += int64(n)
 			conn.Downloaded += int64(n)
+			// Once a byte has been retained, a known-size response can recover by
+			// validator (or restart without one). Before this point a retry must
+			// continue treating its full response as authoritative.
+			f.sequentialRestartPending = false
 			// Update connection speed periodically
 			now := time.Now().UnixNano()
 			if conn.lastSpeedCheck == 0 {
@@ -1323,13 +1451,16 @@ func (f *Fetcher) downloadChunkOnce(conn *connection, client *http.Client, buf [
 		if err != nil {
 			if err == io.EOF {
 				if intentionalRestart && resp.ContentLength < 0 {
-					if err := f.resizeSequentialResource(responseBytesRead); err != nil {
+					if err := f.finalizeSequentialResourceSize(responseBytesRead); err != nil {
 						return err
 					}
 				}
 				if expectedResponseLength >= 0 && responseBytesRead != expectedResponseLength {
 					return fmt.Errorf("%w: response body length %d, expected %d", errInvalidRangeResponse, responseBytesRead, expectedResponseLength)
 				}
+				f.connMu.Lock()
+				f.sequentialRestartPending = false
+				f.connMu.Unlock()
 				return nil
 			}
 			return err
@@ -1373,21 +1504,35 @@ func validateRangeResponse(resp *http.Response, requestedStart, requestedEnd, to
 	return expectedLength, nil
 }
 
-// fallbackToSequentialDownload handles origins that advertise byte ranges but
-// ignore the first Range request and return the full representation with 200.
-// Slow start launches only the primary connection initially, so it is safe to
-// reset the prefetch offset and consume that response from byte zero. If the
-// server changes behavior after parallel connections have started, fail rather
-// than risk assembling a corrupt file.
-func (f *Fetcher) fallbackToSequentialDownload(conn *connection, ifRange string) error {
+// beginSequentialResponse makes an authoritative full response and all of its
+// recovery state visible atomically. Truncation removes both an obsolete
+// prefetched prefix and stale tail bytes from a previous representation.
+func (f *Fetcher) beginSequentialResponse(conn *connection, ifRange string, size int64, requireInitialRange bool) error {
 	f.connMu.Lock()
 	defer f.connMu.Unlock()
 
-	if !f.meta.Res.Range {
-		return nil
+	if requireInitialRange {
+		if !f.meta.Res.Range || conn.ID != 0 || len(f.connections) != 1 {
+			return errRangeRequestIgnored
+		}
 	}
-	if conn.ID != 0 || len(f.connections) != 1 {
-		return errRangeRequestIgnored
+	if err := f.advanceRecoveryGenerationLocked(); err != nil {
+		return err
+	}
+
+	truncateSize := size
+	if truncateSize < 0 {
+		truncateSize = 0
+	}
+	f.fileMu.Lock()
+	if f.file == nil {
+		f.fileMu.Unlock()
+		return errors.New("target file is not open")
+	}
+	err := f.file.Truncate(truncateSize)
+	f.fileMu.Unlock()
+	if err != nil {
+		return err
 	}
 
 	f.meta.Res.Range = false
@@ -1396,46 +1541,35 @@ func (f *Fetcher) fallbackToSequentialDownload(conn *connection, ifRange string)
 	f.ifRange = ifRange
 	f.resetConnectionForRestart(conn)
 	f.resolveDataPos.Store(0)
+	f.meta.Res.Size = truncateSize
+	if len(f.meta.Res.Files) > 0 {
+		f.meta.Res.Files[0].Size = truncateSize
+	}
+	f.sequentialSizeUnknown = size < 0
+	f.sequentialRestartPending = true
 	return nil
 }
 
-// restartSequentialDownload consumes an If-Range 200 response as the complete
-// current representation. The old prefix is no longer trusted, but this body
-// can safely overwrite it from byte zero.
-func (f *Fetcher) restartSequentialDownload(conn *connection, ifRange string) {
-	f.connMu.Lock()
-	defer f.connMu.Unlock()
-
-	f.meta.Res.Range = false
-	f.rangeReprobeEligible = true
-	f.rangeValidatorPinned = false
-	f.ifRange = ifRange
-	f.resetConnectionForRestart(conn)
-	f.resolveDataPos.Store(0)
-}
-
-// resizeSequentialResource makes a full restart response authoritative for
-// both progress accounting and the target file. Truncation removes stale tail
-// bytes when the new representation is shorter and preallocates when longer.
-func (f *Fetcher) resizeSequentialResource(size int64) error {
+// finalizeSequentialResourceSize records the observed size of a complete
+// unknown-length response without resetting the bytes already written.
+func (f *Fetcher) finalizeSequentialResourceSize(size int64) error {
 	if size < 0 {
 		return fmt.Errorf("invalid sequential response size %d", size)
 	}
 
-	// Keep the file mutation and its recovery metadata in one connMu critical
-	// section so Store cannot persist one side of the transition without the
-	// other. Other download paths never hold fileMu while acquiring connMu.
 	f.connMu.Lock()
+	defer f.connMu.Unlock()
+	if err := f.advanceRecoveryGenerationLocked(); err != nil {
+		return err
+	}
 	f.fileMu.Lock()
 	if f.file == nil {
 		f.fileMu.Unlock()
-		f.connMu.Unlock()
 		return errors.New("target file is not open")
 	}
 	err := f.file.Truncate(size)
 	f.fileMu.Unlock()
 	if err != nil {
-		f.connMu.Unlock()
 		return err
 	}
 
@@ -1444,37 +1578,7 @@ func (f *Fetcher) resizeSequentialResource(size int64) error {
 		f.meta.Res.Files[0].Size = size
 	}
 	f.sequentialSizeUnknown = false
-	f.connMu.Unlock()
-	return nil
-}
-
-// beginUnknownSizeSequentialResource discards all stale bytes and records that
-// a restarted chunked response has no authoritative total size yet. If this
-// response is interrupted, the persisted flag forces the next attempt to start
-// from byte zero instead of validating a Range response against an old size.
-func (f *Fetcher) beginUnknownSizeSequentialResource() error {
-	f.connMu.Lock()
-	f.fileMu.Lock()
-	if f.file == nil {
-		f.fileMu.Unlock()
-		f.connMu.Unlock()
-		return errors.New("target file is not open")
-	}
-	err := f.file.Truncate(0)
-	f.fileMu.Unlock()
-	if err != nil {
-		f.connMu.Unlock()
-		return err
-	}
-
-	f.meta.Res.Size = 0
-	if len(f.meta.Res.Files) > 0 {
-		f.meta.Res.Files[0].Size = 0
-	}
-	f.sequentialSizeUnknown = true
-	f.ifRange = ""
-	f.rangeValidatorPinned = false
-	f.connMu.Unlock()
+	f.sequentialRestartPending = false
 	return nil
 }
 
@@ -1482,6 +1586,18 @@ func (f *Fetcher) beginUnknownSizeSequentialResource() error {
 // This is crucial for one-time URLs that can only be accessed once
 func (f *Fetcher) runConnectionWithResolveResp(conn *connection) {
 	defer f.wg.Done()
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		// A reused full response cannot be resumed safely after interruption.
+		// Persist an authoritative restart so the next Start truncates stale bytes
+		// before accepting a possibly different current representation.
+		f.connMu.Lock()
+		f.sequentialRestartPending = true
+		f.connMu.Unlock()
+	}()
 
 	f.connMu.Lock()
 	conn.State = connConnecting
@@ -1497,11 +1613,19 @@ func (f *Fetcher) runConnectionWithResolveResp(conn *connection) {
 
 	if resp == nil {
 		// No resolve response available, fall back to normal connection
+		completed = true // The fallback owns its own restart bookkeeping.
 		f.runConnectionFallback(conn)
 		return
 	}
 
 	defer resp.Body.Close()
+	unknownSize := resp.ContentLength < 0
+	if unknownSize {
+		f.connMu.Lock()
+		f.sequentialSizeUnknown = true
+		f.sequentialRestartPending = true
+		f.connMu.Unlock()
+	}
 
 	f.connMu.Lock()
 	conn.State = connDownloading
@@ -1512,12 +1636,11 @@ func (f *Fetcher) runConnectionWithResolveResp(conn *connection) {
 	f.primaryReadyOnce.Do(func() {
 		close(f.primaryReadyCh)
 	})
-	if f.slowStart != nil {
-		f.slowStart.onConnectSuccess()
-	}
+	f.reportBatchResult(conn, true)
 
 	// Download data from resolve response
 	reader := NewTimeoutReader(resp.Body, readTimeout)
+	var responseBytesRead int64
 	for {
 		if conn.ctx.Err() != nil {
 			return
@@ -1525,6 +1648,7 @@ func (f *Fetcher) runConnectionWithResolveResp(conn *connection) {
 
 		n, err := reader.Read(buf)
 		if n > 0 {
+			responseBytesRead += int64(n)
 			f.connMu.Lock()
 			writeOffset := conn.Chunk.Downloaded
 			f.connMu.Unlock()
@@ -1538,9 +1662,7 @@ func (f *Fetcher) runConnectionWithResolveResp(conn *connection) {
 					conn.State = connFailed
 					conn.failed = true
 					f.connMu.Unlock()
-					if f.slowStart != nil {
-						f.slowStart.onConnectFailed()
-					}
+					f.reportBatchResult(conn, false)
 					return
 				}
 			}
@@ -1553,15 +1675,34 @@ func (f *Fetcher) runConnectionWithResolveResp(conn *connection) {
 		}
 		if err != nil {
 			if err == io.EOF {
+				if unknownSize {
+					if err := f.finalizeSequentialResourceSize(responseBytesRead); err != nil {
+						f.connMu.Lock()
+						conn.State = connFailed
+						conn.failed = true
+						conn.lastErr = err
+						f.connMu.Unlock()
+						f.reportBatchResult(conn, false)
+						return
+					}
+				}
 				f.connMu.Lock()
+				f.sequentialRestartPending = false
 				conn.Completed = true
 				conn.State = connCompleted
 				f.connMu.Unlock()
+				completed = true
 				return
 			}
-			// Reading from resolve response failed: treat as transient (do not count as fail)
+			// A cached redirect may have expired by terminating the body. Force the
+			// next full restart through the original URL so redirects can refresh.
+			if f.hasRedirectURL() {
+				f.updateRedirectURL("")
+			}
 			f.connMu.Lock()
 			conn.State = connFailed
+			conn.failed = true
+			conn.lastErr = err
 			f.connMu.Unlock()
 			return
 		}
@@ -1570,99 +1711,31 @@ func (f *Fetcher) runConnectionWithResolveResp(conn *connection) {
 
 // runConnectionFallback is used when resolve response is not available
 func (f *Fetcher) runConnectionFallback(conn *connection) {
-	// Use fast-fail client for quick retry during download phase
 	client := f.buildFastFailClient()
 	buf := make([]byte, 8192)
-
 	retries := 0
-	countedRetries := 0
+	f.connMu.Lock()
+	conn.retryTimes = 0
+	f.connMu.Unlock()
 
 	for {
 		if conn.ctx.Err() != nil {
 			return
 		}
-
-		// Rebuild client with updated fast-fail timeout on retries
+		f.connMu.Lock()
+		conn.State = connConnecting
+		conn.failed = false
+		f.connMu.Unlock()
 		if retries > 0 {
 			client = f.buildFastFailClient()
 		}
 
-		f.connMu.Lock()
-		conn.State = connConnecting
-		f.connMu.Unlock()
-
-		err := func() error {
-			httpReq, err := f.buildRequest(conn.ctx, f.meta.Req)
-			if err != nil {
-				return err
-			}
-
-			// Record connection start time for adaptive timeout tracking
-			connStartTime := time.Now()
-
-			resp, err := client.Do(httpReq)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != base.HttpCodeOK && resp.StatusCode != base.HttpCodePartialContent {
-				return NewRequestError(resp.StatusCode)
-			}
-
-			// Record successful connection time for adaptive timeout
-			f.updateMaxConnTime(time.Since(connStartTime))
-
-			f.connMu.Lock()
-			conn.State = connDownloading
-			conn.failed = false
-			f.connMu.Unlock()
-
-			f.primaryReadyOnce.Do(func() {
-				close(f.primaryReadyCh)
-			})
-			if f.slowStart != nil {
-				f.slowStart.onConnectSuccess()
-			}
-
-			reader := NewTimeoutReader(resp.Body, readTimeout)
-			for {
-				if conn.ctx.Err() != nil {
-					return conn.ctx.Err()
-				}
-
-				n, err := reader.Read(buf)
-				if n > 0 {
-					f.connMu.Lock()
-					writeOffset := conn.Chunk.Downloaded
-					f.connMu.Unlock()
-
-					f.fileMu.Lock()
-					if f.file != nil {
-						_, writeErr := f.file.WriteAt(buf[:n], writeOffset)
-						if writeErr != nil {
-							f.fileMu.Unlock()
-							return writeErr
-						}
-					}
-					f.fileMu.Unlock()
-
-					f.connMu.Lock()
-					conn.Chunk.Downloaded += int64(n)
-					conn.Downloaded += int64(n)
-					f.connMu.Unlock()
-				}
-				if err != nil {
-					if err == io.EOF {
-						return nil
-					}
-					return err
-				}
-			}
-		}()
+		err := f.downloadChunkOnce(conn, client, buf)
 
 		if err == nil {
 			f.connMu.Lock()
+			conn.retryTimes = 0
+			conn.lastErr = nil
 			conn.Completed = true
 			conn.State = connCompleted
 			f.connMu.Unlock()
@@ -1672,60 +1745,42 @@ func (f *Fetcher) runConnectionFallback(conn *connection) {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-
-		if re := extractRequestError(err); re != nil {
-			conn.lastErr = re
-		} else {
-			conn.lastErr = err
-		}
-
-		if shouldCountHTTPFailure(err) {
-			// Immediate fail for server connection limit (403)
-			if re := extractRequestError(err); re != nil && re.Code == 403 {
-				f.connMu.Lock()
-				conn.State = connFailed
-				conn.failed = true
-				f.connMu.Unlock()
-				if f.slowStart != nil {
-					f.slowStart.onConnectFailed()
-				}
-				return
-			}
-			conn.retryTimes++
-			countedRetries++
-			if countedRetries >= 3 {
-				f.connMu.Lock()
-				conn.State = connFailed
-				conn.failed = true
-				f.connMu.Unlock()
-				if f.slowStart != nil {
-					f.slowStart.onConnectFailed()
-				}
-				return
-			}
-			// Retry again for counted failures below the cap
+		if isTerminalRangeError(err) {
 			f.connMu.Lock()
+			conn.lastErr = err
 			conn.State = connFailed
+			conn.failed = true
 			f.connMu.Unlock()
-			retryDelay := time.Second * time.Duration(retries+1)
-			if retryDelay > 5*time.Second {
-				retryDelay = 5 * time.Second
-			}
-			retries++
-			time.Sleep(retryDelay)
-			continue
+			f.reportBatchResult(conn, false)
+			return
 		}
-
-		// Retry indefinitely for non-counted errors
+		storedErr := err
+		if re := extractRequestError(err); re != nil {
+			storedErr = re
+		}
+		if extractRequestError(err) == nil && f.hasRedirectURL() {
+			f.updateRedirectURL("")
+		}
 		f.connMu.Lock()
+		conn.lastErr = storedErr
 		conn.State = connFailed
+		conn.failed = true
+		conn.retryTimes++
+		exhausted := conn.retryTimes >= maxConnectionAttempts(err)
 		f.connMu.Unlock()
-		retryDelay := time.Second * time.Duration(retries+1)
-		if retryDelay > 5*time.Second {
-			retryDelay = 5 * time.Second
+		if exhausted {
+			f.reportBatchResult(conn, false)
+			return
 		}
+		retryDelay := connectionRetryDelay(err, retries)
 		retries++
-		time.Sleep(retryDelay)
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-conn.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 
@@ -1734,6 +1789,24 @@ func (f *Fetcher) runConnectionFallback(conn *connection) {
 func (f *Fetcher) helpOtherConnection(helper *connection) bool {
 	f.connMu.Lock()
 	defer f.connMu.Unlock()
+
+	// A connection-limit response does not mean its assigned bytes exist. Give
+	// the entire unfilled suffix to a connection that the origin still accepts.
+	// Mark only the rejected connection's already downloaded prefix as complete;
+	// the helper must actually fetch every reclaimed byte before completion.
+	for _, rejected := range f.connections {
+		if rejected == helper || !rejected.exited || rejected.Chunk == nil || !isConnectionLimitFailure(rejected) {
+			continue
+		}
+		remain := rejected.Chunk.remain()
+		if remain <= 0 {
+			continue
+		}
+		reclaimStart := rejected.Chunk.Begin + rejected.Chunk.Downloaded
+		helper.Chunk = newChunk(reclaimStart, rejected.Chunk.End)
+		rejected.Chunk.End = reclaimStart - 1
+		return true
+	}
 
 	// Find the connection with longest remaining time
 	var slowestConn *connection
@@ -1813,7 +1886,7 @@ func (f *Fetcher) hasSequentialPrefixLocked(conn *connection) bool {
 // canProbeSequentialResumeLocked reports whether the prefix can be resumed
 // safely with If-Range. The caller must hold connMu.
 func (f *Fetcher) canProbeSequentialResumeLocked(conn *connection) bool {
-	return !f.sequentialSizeUnknown && f.ifRange != "" && f.hasSequentialPrefixLocked(conn)
+	return !f.sequentialSizeUnknown && !f.sequentialRestartPending && f.ifRange != "" && f.hasSequentialPrefixLocked(conn)
 }
 
 func (f *Fetcher) hasSequentialRecoveryCandidate() bool {
@@ -1839,12 +1912,9 @@ func (f *Fetcher) resumeConnections() {
 		// 1. They have exhausted retries (retryTimes >= 3), OR
 		// 2. They failed with a permanent error like 403
 		if conn.State == connFailed && conn.failed {
-			// Check if it's a permanent error (like 403)
-			if re := extractRequestError(conn.lastErr); re != nil && re.Code == 403 {
-				continue
-			}
-			// Check if retries exhausted
-			if conn.retryTimes >= 3 {
+			// Pausing during a retry backoff must not strand the connection. Skip
+			// only a genuinely exhausted terminal attempt.
+			if conn.retryTimes >= maxConnectionAttempts(conn.lastErr) {
 				continue
 			}
 		}
@@ -1855,6 +1925,7 @@ func (f *Fetcher) resumeConnections() {
 		conn.ctx, conn.cancel = context.WithCancel(f.ctx)
 		conn.State = connNotStarted
 		conn.failed = false // Clear failed flag for resumed connection
+		conn.batchReported = false
 		toResume = append(toResume, conn)
 	}
 	f.connMu.Unlock()
@@ -1877,44 +1948,24 @@ func (f *Fetcher) waitForCompletion(ctx context.Context) {
 func (f *Fetcher) onDownloadComplete() {
 	f.connMu.Lock()
 
-	// First, check if download actually completed successfully
-	// Calculate total downloaded from all connections
-	totalDownloaded := int64(0)
-	if f.resolveConn != nil {
-		totalDownloaded += f.resolveConn.Downloaded
-	}
-	for _, conn := range f.connections {
-		totalDownloaded += conn.Downloaded
-	}
-
-	// Check if all chunks are complete (no remaining bytes)
+	// Check if all chunks are complete (no remaining bytes). A failed worker's
+	// assignment is still missing until another connection has reclaimed it.
 	allChunksComplete := true
 	for _, conn := range f.connections {
 		needsMoreData := false
 		if f.meta.Res.Range {
-			needsMoreData = conn.Chunk != nil && conn.Chunk.remain() > 0
+			needsMoreData = conn.Chunk == nil || conn.Chunk.remain() > 0
 		} else if f.meta.Res.Size > 0 {
 			needsMoreData = conn.Downloaded < f.meta.Res.Size
 		} else {
 			needsMoreData = !conn.Completed && conn.State != connCompleted
 		}
 
-		if needsMoreData && !conn.Completed && conn.State != connCompleted {
-			// This connection has remaining work and isn't done
-			// Check if it failed with 403 (server limit) - these can be ignored if other connections completed the work
-			if conn.State == connFailed && conn.failed {
-				if re := extractRequestError(conn.lastErr); re != nil && re.Code == 403 {
-					// 403 is server connection limit, check if other connections will complete this chunk
-					continue
-				}
-			}
+		if needsMoreData {
 			allChunksComplete = false
 			break
 		}
 	}
-
-	// If total downloaded matches file size, consider it a success regardless of connection failures
-	downloadComplete := f.meta.Res.Size > 0 && totalDownloaded >= f.meta.Res.Size
 
 	// Integrity errors must win over byte-count completion. A malformed response
 	// may be detected only after the expected bytes have already been written.
@@ -1926,23 +1977,34 @@ func (f *Fetcher) onDownloadComplete() {
 		}
 	}
 
-	// Check for other errors, but ignore 403 (server connection limit) errors if download completed.
-	if finalErr == nil && !downloadComplete && !allChunksComplete {
+	// Report any incomplete assignment even when aggregate byte counters happen
+	// to reach the expected size. Counters cannot prove that every offset exists.
+	if finalErr == nil && !allChunksComplete {
 		for _, conn := range f.connections {
-			if conn.State == connFailed && conn.failed {
-				// Skip 403 errors (server connection limit) - these are expected when exceeding server's limit
-				if re := extractRequestError(conn.lastErr); re != nil && re.Code == 403 {
-					continue
-				}
-				if re := extractRequestError(conn.lastErr); re != nil {
-					finalErr = fmt.Errorf("connection %d failed: retries=%d, status=%d", conn.ID, conn.retryTimes, re.Code)
-				} else if conn.lastErr != nil {
-					finalErr = fmt.Errorf("connection %d failed: retries=%d, err=%v", conn.ID, conn.retryTimes, conn.lastErr)
-				} else {
-					finalErr = fmt.Errorf("connection %d failed: retries=%d", conn.ID, conn.retryTimes)
-				}
-				break
+			missing := int64(0)
+			if f.meta.Res.Range && conn.Chunk != nil {
+				missing = conn.Chunk.remain()
+			} else if !f.meta.Res.Range && f.meta.Res.Size > conn.Downloaded {
+				missing = f.meta.Res.Size - conn.Downloaded
 			}
+			if missing <= 0 {
+				continue
+			}
+			if conn.State == connFailed && conn.failed {
+				if re := extractRequestError(conn.lastErr); re != nil {
+					finalErr = fmt.Errorf("connection %d left %d bytes incomplete: retries=%d, status=%d: %w", conn.ID, missing, conn.retryTimes, re.Code, re)
+				} else if conn.lastErr != nil {
+					finalErr = fmt.Errorf("connection %d left %d bytes incomplete: retries=%d, err=%v", conn.ID, missing, conn.retryTimes, conn.lastErr)
+				} else {
+					finalErr = fmt.Errorf("connection %d left %d bytes incomplete: retries=%d", conn.ID, missing, conn.retryTimes)
+				}
+			} else {
+				finalErr = fmt.Errorf("connection %d left %d bytes incomplete", conn.ID, missing)
+			}
+			break
+		}
+		if finalErr == nil {
+			finalErr = errors.New("download completed with unfilled byte ranges")
 		}
 	}
 	f.connMu.Unlock()
@@ -2008,53 +2070,64 @@ func (f *Fetcher) checkCompletion() bool {
 
 // Patch modifies the HTTP request information.
 func (f *Fetcher) Patch(req *base.Request, opts *base.Options) error {
+	if req == nil {
+		return nil
+	}
+	if req.Extra != nil {
+		if err := base.ParseReqExtra[fhttp.ReqExtra](req); err != nil {
+			return err
+		}
+	}
+
+	urlChanged := req.URL != ""
+	f.connMu.Lock()
 	// Patch request info
-	if req != nil {
-		if req.URL != "" {
-			f.meta.Req.URL = req.URL
-			// Clear redirect URL when URL is changed, so new requests use the new URL
-			f.updateRedirectURL("")
+	if req.URL != "" {
+		f.meta.Req.URL = req.URL
+	}
+	if req.Extra != nil {
+		patchExtra := req.Extra.(*fhttp.ReqExtra)
+		// Merge Extra fields instead of replacing entirely
+		if f.meta.Req.Extra == nil {
+			f.meta.Req.Extra = &fhttp.ReqExtra{}
 		}
-		if req.Extra != nil {
-			if err := base.ParseReqExtra[fhttp.ReqExtra](req); err != nil {
-				return err
+		existingExtra := f.meta.Req.Extra.(*fhttp.ReqExtra)
+		// Update Method only if non-empty
+		if patchExtra.Method != "" {
+			existingExtra.Method = patchExtra.Method
+		}
+		// Update Body only if non-empty
+		if patchExtra.Body != "" {
+			existingExtra.Body = patchExtra.Body
+		}
+		// Merge Headers: existing keys are overwritten, new keys are added
+		if patchExtra.Header != nil {
+			if existingExtra.Header == nil {
+				existingExtra.Header = make(map[string]string)
 			}
-			patchExtra := req.Extra.(*fhttp.ReqExtra)
-			// Merge Extra fields instead of replacing entirely
-			if f.meta.Req.Extra == nil {
-				f.meta.Req.Extra = &fhttp.ReqExtra{}
-			}
-			existingExtra := f.meta.Req.Extra.(*fhttp.ReqExtra)
-			// Update Method only if non-empty
-			if patchExtra.Method != "" {
-				existingExtra.Method = patchExtra.Method
-			}
-			// Update Body only if non-empty
-			if patchExtra.Body != "" {
-				existingExtra.Body = patchExtra.Body
-			}
-			// Merge Headers: existing keys are overwritten, new keys are added
-			if patchExtra.Header != nil {
-				if existingExtra.Header == nil {
-					existingExtra.Header = make(map[string]string)
-				}
-				for k, v := range patchExtra.Header {
-					existingExtra.Header[k] = v
-				}
+			for k, v := range patchExtra.Header {
+				existingExtra.Header[k] = v
 			}
 		}
-		// Merge Labels: existing keys are overwritten, new keys are added
-		if req.Labels != nil {
-			if f.meta.Req.Labels == nil {
-				f.meta.Req.Labels = make(map[string]string)
-			}
-			for k, v := range req.Labels {
-				f.meta.Req.Labels[k] = v
-			}
+	}
+	// Merge Labels: existing keys are overwritten, new keys are added
+	if req.Labels != nil {
+		if f.meta.Req.Labels == nil {
+			f.meta.Req.Labels = make(map[string]string)
 		}
-		if req.Proxy != nil {
-			f.meta.Req.Proxy = req.Proxy
+		for k, v := range req.Labels {
+			f.meta.Req.Labels[k] = v
 		}
+	}
+	if req.Proxy != nil {
+		f.meta.Req.Proxy = req.Proxy
+	}
+	f.connMu.Unlock()
+
+	if urlChanged {
+		// Clear redirect URL after releasing connMu so metadata snapshots never
+		// participate in the redirect-lock ordering.
+		f.updateRedirectURL("")
 	}
 
 	return nil
@@ -2068,15 +2141,8 @@ func (f *Fetcher) Pause() error {
 		f.resolveCancel()
 	}
 
-	// Stop prefetch if running
-	if f.prefetchStopCh != nil {
-		select {
-		case <-f.prefetchStopCh:
-			// Already closed
-		default:
-			close(f.prefetchStopCh)
-		}
-	}
+	// Stop prefetch if running and wait for its shared file state to settle.
+	f.stopAsyncPrefetch()
 
 	// Wait for downloadLoop to exit first (it will call wg.Wait internally)
 	if f.downloadLoopDone != nil {
@@ -2085,11 +2151,6 @@ func (f *Fetcher) Pause() error {
 
 	// Wait for all connection goroutines to stop
 	f.wg.Wait()
-
-	// Wait for prefetch to finish
-	for f.prefetchStopCh != nil && !f.prefetchDone.Load() {
-		time.Sleep(10 * time.Millisecond)
-	}
 
 	// Clean up prefetch file
 	f.cleanupPrefetchFile()
@@ -2123,6 +2184,30 @@ func (f *Fetcher) Close() error {
 
 func (f *Fetcher) Meta() *fetcher.FetcherMeta {
 	return f.meta
+}
+
+// MetaSnapshot returns a coherent copy for API responses and persistence while
+// recovery code may be changing mode, size, and file metadata together.
+func (f *Fetcher) MetaSnapshot() *fetcher.FetcherMeta {
+	f.connMu.Lock()
+	defer f.connMu.Unlock()
+	return util.DeepClone(f.meta)
+}
+
+func (f *Fetcher) RecoveryGeneration() uint64 {
+	return f.recoveryGeneration.Load()
+}
+
+// advanceRecoveryGenerationLocked invalidates any older durable checkpoint
+// before the target file can be truncated. The caller must hold connMu, which
+// also prevents Store from observing the generation and file state halfway
+// through the transition.
+func (f *Fetcher) advanceRecoveryGenerationLocked() error {
+	f.recoveryGeneration.Add(1)
+	if f.ctl != nil && f.ctl.InvalidateResumeState != nil {
+		return f.ctl.InvalidateResumeState()
+	}
+	return nil
 }
 
 func (f *Fetcher) Stats() any {
@@ -2162,5 +2247,9 @@ func (f *Fetcher) Progress() fetcher.Progress {
 }
 
 func (f *Fetcher) Wait() error {
-	return <-f.doneCh
+	err := <-f.doneCh
+	if loopDone := f.downloadLoopDone; loopDone != nil {
+		<-loopDone
+	}
+	return err
 }

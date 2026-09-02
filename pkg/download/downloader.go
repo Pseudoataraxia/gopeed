@@ -32,6 +32,8 @@ const (
 	bucketTask = "task"
 	// task download data bucket
 	bucketSave = "save"
+	// minimum recovery generation accepted for a task
+	bucketSaveFloor = "save_floor"
 	// protocol-level shared client state bucket
 	bucketProtocolState = "protocol_state"
 	// downloader config bucket
@@ -48,6 +50,38 @@ var (
 )
 
 type Listener func(event *Event)
+
+type recoveryFloor struct {
+	Generation uint64
+}
+
+type taskPersistenceState struct {
+	mu      sync.Mutex
+	deleted bool
+	epoch   uint64
+}
+
+type resumeStateOwner struct {
+	mu   sync.RWMutex
+	task *Task
+}
+
+func (o *resumeStateOwner) bind(task *Task) {
+	o.mu.Lock()
+	o.task = task
+	o.mu.Unlock()
+}
+
+func (o *resumeStateOwner) currentTask() *Task {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.task
+}
+
+type preparedFetcher struct {
+	fetcher     fetcher.Fetcher
+	resumeOwner *resumeStateOwner
+}
 
 // ExtractStatus represents the current status of archive extraction
 type ExtractStatus string
@@ -95,7 +129,7 @@ type Downloader struct {
 	ExtensionLogger *logger.Logger
 
 	cfg          *DownloaderConfig
-	fetcherCache map[string]fetcher.Fetcher
+	fetcherCache map[string]*preparedFetcher
 	storage      Storage
 	tasks        []*Task
 	waitTasks    []*Task
@@ -123,7 +157,7 @@ func NewDownloader(cfg *DownloaderConfig) *Downloader {
 
 	d := &Downloader{
 		cfg:          cfg,
-		fetcherCache: make(map[string]fetcher.Fetcher),
+		fetcherCache: make(map[string]*preparedFetcher),
 		waitTasks:    make([]*Task, 0),
 		storage:      cfg.Storage,
 
@@ -147,7 +181,7 @@ func (d *Downloader) Setup() error {
 	d.blob = internalblob.NewRegistry("")
 
 	// setup storage
-	if err := d.storage.Setup([]string{bucketTask, bucketSave, bucketProtocolState, bucketConfig, bucketExtension, bucketExtensionStorage}); err != nil {
+	if err := d.storage.Setup([]string{bucketTask, bucketSave, bucketSaveFloor, bucketProtocolState, bucketConfig, bucketExtension, bucketExtensionStorage}); err != nil {
 		return err
 	}
 	// load config from storage
@@ -221,8 +255,9 @@ func (d *Downloader) Setup() error {
 	d.cleanupNonExistingTasks()
 
 	// handle upload
+	uploadTasks := append([]*Task(nil), d.tasks...)
 	go func() {
-		for _, task := range d.tasks {
+		for _, task := range uploadTasks {
 			if task.Status == base.DownloadStatusDone && task.Uploading {
 				if err := d.restoreTask(task); err != nil {
 					d.Logger.Error().Stack().Err(err).Msgf("task upload restore fetcher failed, task id: %s", task.ID)
@@ -239,8 +274,11 @@ func (d *Downloader) Setup() error {
 	// calculate download speed every tick
 	go func() {
 		for !d.closed.Load() {
-			if len(d.tasks) > 0 {
-				for _, task := range d.tasks {
+			d.lock.Lock()
+			tasks := append([]*Task(nil), d.tasks...)
+			d.lock.Unlock()
+			if len(tasks) > 0 {
+				for _, task := range tasks {
 					func() {
 						// Do not acquire d.lock (via GetTask) while holding
 						// statusLock; scheduling uses the opposite lock order.
@@ -349,7 +387,8 @@ func (d *Downloader) parseFm(url string) (fetcher.FetcherManager, error) {
 	return nil, ErrUnSupportedProtocol
 }
 
-func (d *Downloader) setupFetcher(fm fetcher.FetcherManager, fetcher fetcher.Fetcher) {
+func (d *Downloader) setupFetcher(fm fetcher.FetcherManager, fetcher fetcher.Fetcher) *resumeStateOwner {
+	owner := &resumeStateOwner{}
 	ctl := controller.NewController()
 	ctl.GetConfig = func(v any) {
 		d.getProtocolConfig(fm.Name(), v)
@@ -374,31 +413,137 @@ func (d *Downloader) setupFetcher(fm fetcher.FetcherManager, fetcher fetcher.Fet
 			return d.cfg.Proxy.ToHandler()
 		}
 	}
+	ctl.InvalidateResumeState = func() error {
+		task := owner.currentTask()
+		if task == nil {
+			return nil
+		}
+		return d.invalidateResumeState(task, fetcher, owner)
+	}
 	fetcher.Setup(ctl)
+	return owner
 }
 
 func (d *Downloader) saveTask(task *Task) error {
-	data, err := task.fetcherManager.Store(task.fetcher)
+	// A worker may invalidate and replace recovery state while Store is being
+	// written. Retry until the generation is unchanged before and after the
+	// durable write; an invalidator deletes any stale record before truncating.
+	for attempt := 0; ; attempt++ {
+		if attempt >= 16 {
+			return errors.New("recovery state changed too frequently to persist")
+		}
+		state := ensureTaskPersistence(task)
+		state.mu.Lock()
+		if state.deleted {
+			state.mu.Unlock()
+			return nil
+		}
+		epoch := state.epoch
+		state.mu.Unlock()
+
+		generationBefore, versioned := recoveryGeneration(task.fetcher)
+		data, err := task.fetcherManager.Store(task.fetcher)
+		if err != nil {
+			d.Logger.Error().Stack().Err(err).Msgf("serialize fetcher failed: %s", task.ID)
+			return err
+		}
+		taskSnapshot := task.clone()
+		generationAfter, _ := recoveryGeneration(task.fetcher)
+		if versioned && generationBefore != generationAfter {
+			continue
+		}
+		state.mu.Lock()
+		if state.deleted {
+			state.mu.Unlock()
+			return nil
+		}
+		if state.epoch != epoch {
+			state.mu.Unlock()
+			continue
+		}
+		generationCommitted, _ := recoveryGeneration(task.fetcher)
+		if versioned && generationCommitted != generationAfter {
+			state.mu.Unlock()
+			continue
+		}
+		if data != nil {
+			if err := d.storage.Put(bucketSave, task.ID, data); err != nil {
+				state.mu.Unlock()
+				d.Logger.Error().Stack().Err(err).Msgf("persist fetcher failed: %s", task.ID)
+				return err
+			}
+		} else {
+			if err := d.storage.Delete(bucketSave, task.ID); err != nil {
+				state.mu.Unlock()
+				d.Logger.Error().Stack().Err(err).Msgf("clear fetcher state failed: %s", task.ID)
+				return err
+			}
+		}
+		// Memory storage keeps the supplied value by reference, so persist the
+		// detached task snapshot captured in the same recovery generation.
+		if err := d.storage.Put(bucketTask, task.ID, taskSnapshot); err != nil {
+			state.mu.Unlock()
+			d.Logger.Error().Stack().Err(err).Msgf("persist task failed: %s", task.ID)
+			return err
+		}
+		state.mu.Unlock()
+		return nil
+	}
+}
+
+func recoveryGeneration(f fetcher.Fetcher) (uint64, bool) {
+	provider, ok := f.(fetcher.RecoveryGenerationProvider)
+	if !ok {
+		return 0, false
+	}
+	return provider.RecoveryGeneration(), true
+}
+
+func ensureTaskPersistence(task *Task) *taskPersistenceState {
+	if task.persistence == nil {
+		task.persistence = &taskPersistenceState{}
+	}
+	return task.persistence
+}
+
+func (d *Downloader) readRecoveryFloor(taskID string) (uint64, bool, error) {
+	var floor recoveryFloor
+	found, err := d.storage.Get(bucketSaveFloor, taskID, &floor)
+	return floor.Generation, found, err
+}
+
+func (d *Downloader) invalidateResumeState(task *Task, f fetcher.Fetcher, owner *resumeStateOwner) error {
+	state := ensureTaskPersistence(task)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.deleted {
+		return nil
+	}
+	// A replaced fetcher can finish an old request after a source reset. Its
+	// callback must not invalidate the checkpoint belonging to the replacement.
+	if owner != nil && task.resumeOwner != owner {
+		return nil
+	}
+	if generation, ok := recoveryGeneration(f); ok {
+		if err := d.persistRecoveryFloorLocked(task.ID, generation); err != nil {
+			return err
+		}
+	}
+	return d.storage.Delete(bucketSave, task.ID)
+}
+
+// persistRecoveryFloorLocked durably records the oldest checkpoint generation
+// that may still describe the target file. The caller serializes operations for
+// this task through taskPersistenceState.mu.
+func (d *Downloader) persistRecoveryFloorLocked(taskID string, generation uint64) error {
+	floor, found, err := d.readRecoveryFloor(taskID)
 	if err != nil {
-		d.Logger.Error().Stack().Err(err).Msgf("serialize fetcher failed: %s", task.ID)
 		return err
 	}
-	if data != nil {
-		if err := d.storage.Put(bucketSave, task.ID, data); err != nil {
-			d.Logger.Error().Stack().Err(err).Msgf("persist fetcher failed: %s", task.ID)
-			return err
-		}
-	} else {
-		if err := d.storage.Delete(bucketSave, task.ID); err != nil {
-			d.Logger.Error().Stack().Err(err).Msgf("clear fetcher state failed: %s", task.ID)
-			return err
-		}
+	if found && floor >= generation {
+		return nil
 	}
-	if err := d.storage.Put(bucketTask, task.ID, task); err != nil {
-		d.Logger.Error().Stack().Err(err).Msgf("persist task failed: %s", task.ID)
-		return err
-	}
-	return nil
+	return d.storage.Put(bucketSaveFloor, taskID, &recoveryFloor{Generation: generation})
 }
 
 func ensureRequestRawURL(req *base.Request) {
@@ -443,24 +588,25 @@ func (d *Downloader) Resolve(req *base.Request, opts *base.Options) (rr *Resolve
 		return
 	}
 
-	fetcher, err := d.buildFetcher(req.URL)
+	prepared, err := d.buildFetcher(req.URL)
 	if err != nil {
 		return
 	}
+	worker := prepared.fetcher
 	initOpt, err := d.initOptions(opts)
 	if err != nil {
 		return
 	}
-	err = fetcher.Resolve(req, initOpt)
+	err = worker.Resolve(req, initOpt)
 	if err != nil {
 		return
 	}
 	d.fetcherMapLock.Lock()
-	d.fetcherCache[rrId] = fetcher
+	d.fetcherCache[rrId] = prepared
 	d.fetcherMapLock.Unlock()
 	rr = &ResolveResult{
 		ID:  rrId,
-		Res: fetcher.Meta().Res,
+		Res: worker.Meta().Res,
 	}
 	return
 }
@@ -494,17 +640,16 @@ func (d *Downloader) remainRunningCount() int {
 
 func (d *Downloader) CreateDirect(req *base.Request, opts *base.Options) (taskId string, err error) {
 	ensureRequestRawURL(req)
-	var fetcher fetcher.Fetcher
-	fetcher, err = d.buildFetcher(req.URL)
+	prepared, err := d.buildFetcher(req.URL)
 	if err != nil {
 		return
 	}
-	fetcher.Meta().Req = req
+	prepared.fetcher.Meta().Req = req
 	initOpt, err := d.initOptions(opts)
 	if err != nil {
 		return
 	}
-	return d.doCreate(fetcher, initOpt)
+	return d.doCreate(prepared, initOpt)
 }
 
 func (d *Downloader) CreateDirectBatch(req *base.CreateTaskBatch) (taskId []string, err error) {
@@ -525,7 +670,7 @@ func (d *Downloader) CreateDirectBatch(req *base.CreateTaskBatch) (taskId []stri
 
 func (d *Downloader) Create(rrId string) (taskId string, err error) {
 	d.fetcherMapLock.RLock()
-	fetcher, ok := d.fetcherCache[rrId]
+	prepared, ok := d.fetcherCache[rrId]
 	d.fetcherMapLock.RUnlock()
 	if !ok {
 		return "", errors.New("invalid resource id")
@@ -535,7 +680,7 @@ func (d *Downloader) Create(rrId string) (taskId string, err error) {
 		delete(d.fetcherCache, rrId)
 		d.fetcherMapLock.Unlock()
 	}()
-	return d.doCreate(fetcher, nil)
+	return d.doCreate(prepared, nil)
 }
 
 // Patch modifies task-specific data based on the protocol.
@@ -815,7 +960,9 @@ func (d *Downloader) Stats(id string) (sr any, err error) {
 		err = func() error {
 			task.statusLock.Lock()
 			defer task.statusLock.Unlock()
-
+			if task.fetcher != nil {
+				return nil
+			}
 			return d.restoreFetcher(task)
 		}()
 		if err != nil {
@@ -828,14 +975,26 @@ func (d *Downloader) Stats(id string) (sr any, err error) {
 
 func (d *Downloader) doDelete(task *Task, force bool) (err error) {
 	defer d.releaseBlobTask(task)
-	err = func() error {
-		if err := d.storage.Delete(bucketTask, task.ID); err != nil {
-			return err
-		}
-		if err := d.storage.Delete(bucketSave, task.ID); err != nil {
-			return err
-		}
+	state := ensureTaskPersistence(task)
+	state.mu.Lock()
+	state.deleted = true
+	state.epoch++
+	if err = d.storage.Delete(bucketTask, task.ID); err == nil {
+		err = d.storage.Delete(bucketSave, task.ID)
+	}
+	if err == nil {
+		err = d.storage.Delete(bucketSaveFloor, task.ID)
+	}
+	state.mu.Unlock()
+	if err != nil {
+		d.Logger.Error().Stack().Err(err).Msgf("delete task failed, task id: %s", task.ID)
+		return err
+	}
 
+	err = func() error {
+		// Do not hold the persistence lock while closing the fetcher. HTTP may be
+		// invalidating a checkpoint while it holds its connection lock; keeping
+		// both here would invert that lock order during concurrent deletion.
 		if task.fetcher != nil {
 			if err := task.fetcher.Close(); err != nil {
 				return err
@@ -893,7 +1052,10 @@ func (d *Downloader) Clear() error {
 			return err
 		}
 	}
+	d.lock.Lock()
 	d.tasks = make([]*Task, 0)
+	d.waitTasks = make([]*Task, 0)
+	d.lock.Unlock()
 	d.extensions = make([]*Extension, 0)
 	if err := d.storage.Clear(); err != nil {
 		return err
@@ -1248,7 +1410,22 @@ func (d *Downloader) resetTaskFetcher(task *Task) error {
 	}
 	opts := task.Meta.Opts
 	f := fm.Build()
-	d.setupFetcher(fm, f)
+	owner := d.setupFetcher(fm, f)
+	state := ensureTaskPersistence(task)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.deleted {
+		return ErrTaskNotFound
+	}
+	state.epoch++
+	if generation, ok := recoveryGeneration(task.fetcher); ok {
+		if err := d.persistRecoveryFloorLocked(task.ID, generation+1); err != nil {
+			return err
+		}
+	}
+	if err := d.storage.Delete(bucketSave, task.ID); err != nil {
+		return err
+	}
 	// A fresh source must never inherit bytes or preallocation from the failed
 	// source. HTTP opens existing targets without truncating them, so remove the
 	// old single-file target before installing a fresh fetcher.
@@ -1261,12 +1438,14 @@ func (d *Downloader) resetTaskFetcher(task *Task) error {
 	f.Meta().Opts = opts
 	task.fetcherManager = fm
 	task.fetcher = f
+	task.resumeOwner = owner
+	owner.bind(task)
 	task.Meta = f.Meta()
 	if task.Progress != nil {
 		task.Progress.Downloaded = 0
 		task.Progress.Speed = 0
 	}
-	return d.storage.Delete(bucketSave, task.ID)
+	return d.storage.Delete(bucketSaveFloor, task.ID)
 }
 
 func (d *Downloader) restoreTask(task *Task) error {
@@ -1279,18 +1458,46 @@ func (d *Downloader) restoreTask(task *Task) error {
 }
 
 func (d *Downloader) restoreFetcher(task *Task) error {
-	v, f := task.fetcherManager.Restore()
+	v, restore := task.fetcherManager.Restore()
 	if v != nil {
-		err := d.storage.Pop(bucketSave, task.ID, v)
+		state := ensureTaskPersistence(task)
+		state.mu.Lock()
+		found, err := d.storage.Get(bucketSave, task.ID, v)
 		if err != nil {
+			state.mu.Unlock()
 			return err
 		}
+		floor, hasFloor, err := d.readRecoveryFloor(task.ID)
+		if err != nil {
+			state.mu.Unlock()
+			return err
+		}
+		if found && hasFloor {
+			checkpoint, versioned := v.(fetcher.RecoveryCheckpoint)
+			if !versioned || checkpoint.CheckpointGeneration() < floor {
+				found = false
+				if err := d.storage.Delete(bucketSave, task.ID); err != nil {
+					state.mu.Unlock()
+					return err
+				}
+			}
+		}
+		if found {
+			if err := d.storage.Delete(bucketSave, task.ID); err != nil {
+				state.mu.Unlock()
+				return err
+			}
+		} else {
+			v, restore = task.fetcherManager.Restore()
+		}
+		state.mu.Unlock()
 	}
-	task.fetcher = f(task.Meta, v)
+	task.fetcher = restore(task.Meta, v)
 	if task.fetcher == nil {
 		task.fetcher = task.fetcherManager.Build()
 	}
-	d.setupFetcher(task.fetcherManager, task.fetcher)
+	task.resumeOwner = d.setupFetcher(task.fetcherManager, task.fetcher)
+	task.resumeOwner.bind(task)
 	if task.fetcher.Meta().Req == nil {
 		task.fetcher.Meta().Req = task.Meta.Req
 	}
@@ -1303,7 +1510,8 @@ func (d *Downloader) restoreFetcher(task *Task) error {
 	return nil
 }
 
-func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId string, err error) {
+func (d *Downloader) doCreate(prepared *preparedFetcher, opts *base.Options) (taskId string, err error) {
+	f := prepared.fetcher
 	if f.Meta().Opts == nil {
 		f.Meta().Opts = opts
 	}
@@ -1321,6 +1529,10 @@ func (d *Downloader) doCreate(f fetcher.Fetcher, opts *base.Options) (taskId str
 	task.Progress = &Progress{}
 	_, task.Uploading = f.(fetcher.Uploader)
 	initTask(task)
+	task.resumeOwner = prepared.resumeOwner
+	if task.resumeOwner != nil {
+		task.resumeOwner.bind(task)
+	}
 	if err = d.syncBlobTaskLease(task); err != nil {
 		return "", err
 	}
@@ -1670,14 +1882,14 @@ func (d *Downloader) assignFetcherManager(task *Task) error {
 	return nil
 }
 
-func (d *Downloader) buildFetcher(url string) (fetcher.Fetcher, error) {
+func (d *Downloader) buildFetcher(url string) (*preparedFetcher, error) {
 	fm, err := d.parseFm(url)
 	if err != nil {
 		return nil, err
 	}
-	fetcher := fm.Build()
-	d.setupFetcher(fm, fetcher)
-	return fetcher, nil
+	worker := fm.Build()
+	owner := d.setupFetcher(fm, worker)
+	return &preparedFetcher{fetcher: worker, resumeOwner: owner}, nil
 }
 
 // enqueueExtraction adds an extraction job to the global extraction queue
@@ -2063,6 +2275,7 @@ func initTask(task *Task) {
 
 	task.statusLock = &sync.Mutex{}
 	task.lock = &sync.Mutex{}
+	task.persistence = &taskPersistenceState{}
 	task.blobRefLock = &sync.Mutex{}
 	task.speedArr = make([]int64, 0)
 	task.uploadSpeedArr = make([]int64, 0)

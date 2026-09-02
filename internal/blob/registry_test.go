@@ -118,6 +118,10 @@ func TestRegistryBlobHTTPGetAndRange(t *testing.T) {
 	if got := resp.Header.Get("Accept-Ranges"); got != "bytes" {
 		t.Fatalf("unexpected accept ranges: %q", got)
 	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" || strings.HasPrefix(etag, "W/") {
+		t.Fatalf("expected a strong ETag, got %q", etag)
+	}
 	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
 		t.Fatalf("unexpected content type: %q", got)
 	}
@@ -145,8 +149,36 @@ func TestRegistryBlobHTTPGetAndRange(t *testing.T) {
 	if got := resp.Header.Get("Content-Range"); got != "bytes 6-10/11" {
 		t.Fatalf("unexpected content range: %q", got)
 	}
+	if got := resp.Header.Get("ETag"); got != etag {
+		t.Fatalf("range response ETag changed: got %q want %q", got, etag)
+	}
 	if string(body) != "world" {
 		t.Fatalf("unexpected range body: %q", string(body))
+	}
+
+	req, err = http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=6-10")
+	req.Header.Set("If-Range", `"different-representation"`)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected mismatched If-Range status: %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Range"); got != "" {
+		t.Fatalf("mismatched If-Range retained partial response: %q", got)
+	}
+	if string(body) != "hello world" {
+		t.Fatalf("unexpected mismatched If-Range body: %q", string(body))
 	}
 }
 

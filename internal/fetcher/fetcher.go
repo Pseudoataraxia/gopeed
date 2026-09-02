@@ -31,6 +31,26 @@ type Fetcher interface {
 	Wait() error
 }
 
+// MetaSnapshotter is implemented by fetchers whose metadata may change while
+// a task is being serialized. The returned value must be an immutable snapshot.
+type MetaSnapshotter interface {
+	MetaSnapshot() *FetcherMeta
+}
+
+// RecoveryGenerationProvider exposes the epoch of destructive recovery-state
+// transitions so persistence can reject a snapshot that became stale while it
+// was being written.
+type RecoveryGenerationProvider interface {
+	RecoveryGeneration() uint64
+}
+
+// RecoveryCheckpoint identifies the destructive-state generation encoded in a
+// serialized fetcher snapshot. Downloader restore uses it with a separately
+// persisted invalidation floor to reject crash-stale checkpoints.
+type RecoveryCheckpoint interface {
+	CheckpointGeneration() uint64
+}
+
 type Uploader interface {
 	Upload() error
 	UploadedBytes() int64

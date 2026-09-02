@@ -44,7 +44,14 @@ const (
 
 func StartTestFileServer() net.Listener {
 	return startTestServer(func(sl *shutdownListener) http.Handler {
-		return http.FileServer(http.Dir(Dir))
+		files := http.FileServer(http.Dir(Dir))
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Keep Range tests deterministic even when the fixture was generated
+			// less than 60 seconds ago and Last-Modified is not yet a strong
+			// validator under RFC 9110.
+			w.Header().Set(base.HttpHeaderETag, `"gopeed-test-file-v1"`)
+			files.ServeHTTP(w, r)
+		})
 	})
 }
 
@@ -55,6 +62,7 @@ type SlowFileServer struct {
 
 func (s *SlowFileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	time.Sleep(s.delay)
+	w.Header().Set(base.HttpHeaderETag, `"gopeed-test-file-v1"`)
 	s.handler.ServeHTTP(w, r)
 }
 
@@ -703,6 +711,10 @@ func StartTestRangeBugServer() net.Listener {
 }
 
 func rangeFileHandle(writer http.ResponseWriter, request *http.Request, modifyEnd func(end int64) int64, iocpN func(file *os.File, n int64)) {
+	// These helpers model one stable representation. An explicit strong ETag
+	// keeps Range behavior deterministic and lets production code safely pin
+	// every response to the same bytes.
+	writer.Header().Set(base.HttpHeaderETag, `"gopeed-test-range-v1"`)
 	r := request.Header.Get("Range")
 
 	// If no Range header, return full file with Accept-Ranges header

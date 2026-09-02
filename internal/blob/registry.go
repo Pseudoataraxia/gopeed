@@ -58,6 +58,7 @@ type Metadata struct {
 	ContentType string
 	Size        int64
 	Range       bool
+	ETag        string
 }
 
 type Source struct {
@@ -197,6 +198,7 @@ func (r *Registry) Metadata(raw string) (Metadata, error) {
 		ContentType: src.ContentType,
 		Size:        src.size,
 		Range:       src.rangeEnabled,
+		ETag:        src.etag(),
 	}, nil
 }
 
@@ -340,6 +342,8 @@ func (r *Registry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	if !meta.Range {
 		start, end, ranged = 0, -1, false
+	} else if ranged && req.Header.Get("If-Range") != "" && req.Header.Get("If-Range") != meta.ETag {
+		start, end, ranged = 0, meta.Size-1, false
 	}
 	reader, err := open(req.Context(), OpenRequest{
 		Offset: start,
@@ -395,7 +399,15 @@ func (s *Source) acquireOpen() (Metadata, OpenFunc, SessionRef) {
 		ContentType: s.ContentType,
 		Size:        s.size,
 		Range:       s.rangeEnabled,
+		ETag:        s.etag(),
 	}, s.open, s.session
+}
+
+func (s *Source) etag() string {
+	if !s.rangeEnabled {
+		return ""
+	}
+	return `"` + s.ID + `"`
 }
 
 func (s *Source) acquireTask() error {
@@ -531,6 +543,9 @@ func writeHeaders(w http.ResponseWriter, meta Metadata, start, end int64, ranged
 	}
 	if meta.Range {
 		w.Header().Set("Accept-Ranges", "bytes")
+	}
+	if meta.ETag != "" {
+		w.Header().Set("ETag", meta.ETag)
 	}
 	if meta.Size > 0 {
 		if ranged {
